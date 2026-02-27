@@ -29,6 +29,8 @@ A custom 3D-printable enclosure for this project is available on Printables:
 - Individual topics for each measurement + combined JSON
 - Online/offline status with Last Will and Testament
 - Bidirectional control — send messages to the display from HA
+- Built-in web UI (tabs: **Aktuální data** + **Konfigurace**) on port 80
+- MQTT publish protection: invalid startup values are filtered + warmup delay before first publish
 
 ## Hardware
 
@@ -70,14 +72,7 @@ GPIO8           I2C SCL         SEN66
    File → Open Folder → select sharp-sen66-mqtt-display
    ```
 
-3. **Edit configuration** in `src/main.cpp`:
-   ```cpp
-   const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-   const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-   const char* MQTT_SERVER   = "192.168.0.100";   // Your HA IP
-   const char* MQTT_USER     = "YOUR_MQTT_USER";
-   const char* MQTT_PASSWORD = "YOUR_MQTT_PASSWORD";
-   ```
+3. **Edit initial configuration** in `src/main.cpp` (WiFi + MQTT defaults).
 
 4. **Build and Upload**
    - Press `Ctrl+Shift+P` → type `PlatformIO: Upload` → Enter
@@ -85,6 +80,31 @@ GPIO8           I2C SCL         SEN66
 
 5. **Monitor serial output**
    - Press `Ctrl+Shift+P` → type `PlatformIO: Serial Monitor`
+
+
+## Web Interface
+
+After connecting the device to WiFi, open: `http://<device-ip>/`
+
+### Tabs
+
+1. **Aktuální data**
+   - Live values from SEN66 (temperature, humidity, PM, VOC, NOx, CO2)
+   - WiFi/MQTT status and uptime
+
+2. **Konfigurace**
+   - WiFi: SSID + password
+   - MQTT: server, port, username, password
+   - Display: rotation (0-3, výchozí **2**), invert request
+   - Intervals: display refresh, MQTT publish, MQTT warmup delay
+
+> Konfigurace se ukládá perzistentně do NVS (zůstane po restartu). Po uložení z webu se zařízení automaticky restartuje.
+
+## MQTT Startup Data Protection
+
+To avoid sending invalid first values after restart (e.g. CO2 > 65000), firmware now:
+- validates sensor ranges before accepting data
+- waits default **60s** (`mqttWarmupDelay`) from the first valid sample before MQTT publish
 
 ## MQTT Topics
 
