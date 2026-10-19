@@ -27,6 +27,7 @@
 #include <limits>
 #include "config.h"
 #include "WifiProvisioning.h"
+#include "DisplayDashboard.h"
 
 #define FW_VERSION "2.2.1"
 
@@ -177,48 +178,6 @@ void applyDisplaySettings() {
                 appConfig.displayInvertRequested ? "ano (SW)" : "ne");
 }
 
-void drawCenteredText(const char* text, int y, int textSize) {
-  display.setTextSize(textSize);
-  int16_t x1, y1;
-  uint16_t w, h;
-  display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
-  display.setCursor((DISPLAY_WIDTH - (int)w) / 2, y);
-  display.print(text);
-}
-
-void drawRightAlignedText(const char* text, int y, int textSize) {
-  display.setTextSize(textSize);
-  int16_t x1, y1;
-  uint16_t w, h;
-  display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
-  display.setCursor(DISPLAY_WIDTH - (int)w - 5, y);
-  display.print(text);
-}
-
-void drawDividerLine(int y) {
-  display.drawLine(5, y, DISPLAY_WIDTH - 5, y, inkColor());
-}
-
-// Ikona teplomeru
-void drawThermIcon(int x, int y) {
-  display.drawCircle(x + 3, y + 12, 4, inkColor());
-  display.drawRect(x + 1, y, 5, 12, inkColor());
-  display.fillCircle(x + 3, y + 12, 3, inkColor());
-}
-
-// Ikona kapky (vlhkost)
-void drawDropIcon(int x, int y) {
-  const uint16_t c = inkColor();
-  display.drawPixel(x + 3, y, c);
-  display.drawLine(x + 2, y + 1, x + 4, y + 1, c);
-  display.drawLine(x + 1, y + 2, x + 5, y + 2, c);
-  display.drawLine(x, y + 3, x + 6, y + 3, c);
-  display.drawLine(x, y + 4, x + 6, y + 4, c);
-  display.drawLine(x, y + 5, x + 6, y + 5, c);
-  display.drawLine(x + 1, y + 6, x + 5, y + 6, c);
-  display.drawLine(x + 2, y + 7, x + 4, y + 7, c);
-}
-
 // =============================================
 //  VALIDACE DAT SENZORU
 // =============================================
@@ -254,168 +213,23 @@ bool co2LooksValid(uint16_t co2) {
 
 // Hodnoceni kvality vzduchu podle PM2.5
 const char* getAirQuality(float pm25) {
-  if (pm25 < 12.0)  return "VYNIKAJICI";
-  if (pm25 < 35.4)  return "DOBRE";
-  if (pm25 < 55.4)  return "PRIJATELNE";
-  if (pm25 < 150.4) return "SPATNE";
-  if (pm25 < 250.4) return "VELMI SPATNE";
-  return "NEBEZPECNE";
+  static const char* const labels[] = {"VYNIKAJICI", "DOBRE", "PRIJATELNE", "SPATNE", "VELMI SPATNE", "NEBEZPECNE"};
+  return labels[dashboard::airQualityBand(pm25)];
 }
 
 void drawSensorScreen() {
-  clearCanvas();
-
-  char buf[64];
-
-  // === STATUS BAR ===
-  display.setTextSize(1);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    snprintf(buf, sizeof(buf), "WiFi:%s", WiFi.localIP().toString().c_str());
-  } else if (wifiProvisioning.isCaptiveMode()) {
-    snprintf(buf, sizeof(buf), "AP:%s", wifiProvisioning.getApIp().c_str());
-  } else {
-    snprintf(buf, sizeof(buf), "WiFi:---");
-  }
-  display.setCursor(5, 5);
-  display.print(buf);
-
-  display.setCursor(165, 5);
-  display.print(lastTmepStatus);
-
-  display.setCursor(240, 5);
-  display.print(mqtt.connected() ? "MQTT:OK" : "MQTT:---");
-
-  display.setCursor(315, 5);
-  display.print(sen66Ready ? "SEN66:OK" : "SEN66:---");
-
-  unsigned long uptimeSec = millis() / 1000;
-  unsigned long hrs = uptimeSec / 3600;
-  unsigned long mins = (uptimeSec % 3600) / 60;
-  snprintf(buf, sizeof(buf), "%luh%02lum", hrs, mins);
-  drawRightAlignedText(buf, 5, 1);
-
-  drawDividerLine(18);
-
-  if (!sensorData.valid) {
-    drawCenteredText("Cekam na data", 80, 2);
-    drawCenteredText("ze senzoru SEN66...", 110, 2);
-    display.refresh();
-    return;
-  }
-
-  // === TEPLOTA & VLHKOST ===
-  drawThermIcon(15, 28);
-  snprintf(buf, sizeof(buf), "%.1f", sensorData.temperature);
-  display.setTextSize(4);
-  display.setCursor(35, 25);
-  display.print(buf);
-
-  int16_t x1, y1;
-  uint16_t w, h;
-  display.getTextBounds(buf, 35, 25, &x1, &y1, &w, &h);
-  display.setTextSize(2);
-  display.setCursor(35 + w + 5, 25);
-  display.print("o");
-  display.setCursor(35 + w + 5, 40);
-  display.print("C");
-
-  drawDropIcon(220, 28);
-  snprintf(buf, sizeof(buf), "%.1f", sensorData.humidity);
-  display.setTextSize(4);
-  display.setCursor(240, 25);
-  display.print(buf);
-  display.getTextBounds(buf, 240, 25, &x1, &y1, &w, &h);
-  display.setTextSize(2);
-  display.setCursor(240 + w + 5, 30);
-  display.print("%");
-
-  drawDividerLine(68);
-
-  // === PM HODNOTY ===
-  display.setTextSize(1);
-  display.setCursor(15, 74);
-  display.print("PM1.0");
-  display.setCursor(115, 74);
-  display.print("PM2.5");
-  display.setCursor(215, 74);
-  display.print("PM4.0");
-  display.setCursor(315, 74);
-  display.print("PM10");
-
-  display.setTextSize(3);
-  snprintf(buf, sizeof(buf), "%.0f", sensorData.pm1);
-  display.setCursor(10, 90);
-  display.print(buf);
-
-  snprintf(buf, sizeof(buf), "%.0f", sensorData.pm25);
-  display.setCursor(110, 90);
-  display.print(buf);
-
-  snprintf(buf, sizeof(buf), "%.0f", sensorData.pm4);
-  display.setCursor(210, 90);
-  display.print(buf);
-
-  snprintf(buf, sizeof(buf), "%.0f", sensorData.pm10);
-  display.setCursor(310, 90);
-  display.print(buf);
-
-  display.setTextSize(1);
-  static const int pmUnitX[4] = {15, 115, 215, 315};
-  for (uint8_t i = 0; i < 4; i++) {
-    display.setCursor(pmUnitX[i], 118);
-    display.print("ug/m3");
-  }
-
-  drawDividerLine(132);
-
-  // === VOC, NOx, CO2 ===
-  display.setTextSize(1);
-  display.setCursor(15, 138);
-  display.print("VOC Index");
-  display.setCursor(155, 138);
-  display.print("NOx Index");
-  display.setCursor(295, 138);
-  display.print("CO2");
-
-  display.setTextSize(3);
-  snprintf(buf, sizeof(buf), "%.0f", sensorData.voc);
-  display.setCursor(15, 152);
-  display.print(buf);
-
-  snprintf(buf, sizeof(buf), "%.0f", sensorData.nox);
-  display.setCursor(155, 152);
-  display.print(buf);
-
-  if (sensorData.co2Valid) {
-    snprintf(buf, sizeof(buf), "%u", sensorData.co2);
-  } else {
-    snprintf(buf, sizeof(buf), "---");
-  }
-  display.setCursor(280, 152);
-  display.print(buf);
-
-  display.setTextSize(1);
-  display.setCursor(350, 170);
-  display.print("ppm");
-
-  drawDividerLine(185);
-
-  // === AIR QUALITY BAR ===
-  const char* quality = getAirQuality(sensorData.pm25);
-  display.setTextSize(1);
-  display.setCursor(15, 192);
-  display.print("Kvalita vzduchu:");
-
-  display.setTextSize(3);
-  display.setCursor(15, 208);
-  display.print(quality);
-
-  float barValue = min(sensorData.pm25 / 150.0f, 1.0f);
-  int barWidth = (int)(barValue * 120);
-  display.drawRect(270, 200, 122, 24, inkColor());
-  if (barWidth > 0) display.fillRect(271, 201, barWidth, 22, inkColor());
-
+  String wifiStatus;
+  if (WiFi.status() == WL_CONNECTED) wifiStatus = "Wi-Fi " + WiFi.localIP().toString();
+  else if (wifiProvisioning.isCaptiveMode()) wifiStatus = "AP " + wifiProvisioning.getApIp();
+  else wifiStatus = "Wi-Fi !";
+  const dashboard::Data data = {
+    sensorData.temperature, sensorData.humidity,
+    {sensorData.pm1, sensorData.pm25, sensorData.pm4, sensorData.pm10},
+    sensorData.voc, sensorData.nox, sensorData.co2,
+    sensorData.valid, sensorData.co2Valid, sen66Ready, sensorStale, mqtt.connected(),
+    wifiStatus.c_str(), lastTmepStatus.c_str(), millis() / 1000
+  };
+  dashboard::draw(display, data, inkColor(), appConfig.displayInvertRequested ? BLACK : WHITE);
   display.refresh();
 }
 
@@ -428,29 +242,12 @@ void drawCustomTextScreen() {
 }
 
 void drawSplashScreen() {
-  clearCanvas();
-
-  drawCenteredText("Sharp LCD + SEN66", 40, 3);
-  drawCenteredText("MQTT Dashboard", 80, 2);
-
-  drawDividerLine(110);
-
-  display.setTextSize(1);
-  display.setCursor(30, 125);
-  display.print("FW:   ");
-  display.print(FW_VERSION);
-
-  display.setCursor(30, 140);
-  display.print("WiFi: ");
-  display.print(appConfig.wifiSsid.length() ? appConfig.wifiSsid : String("(nenastaveno)"));
-
-  display.setCursor(30, 155);
-  display.print("MQTT: ");
-  display.print(appConfig.mqttServer.length() ? appConfig.mqttServer : String("(nenastaveno)"));
-
-  display.setCursor(30, 175);
-  display.print("Inicializace...");
-
+  const String firmware = "FW: " + String(FW_VERSION);
+  const String wifi = "Wi-Fi: " + (appConfig.wifiSsid.length() ? appConfig.wifiSsid : String("(nenastaveno)"));
+  const String broker = "MQTT: " + (appConfig.mqttServer.length() ? appConfig.mqttServer : String("(nenastaveno)"));
+  const char* lines[] = {firmware.c_str(), wifi.c_str(), broker.c_str(), "Inicializace..."};
+  dashboard::message(display, "Sharp LCD + SEN66", lines, 4, inkColor(),
+                     appConfig.displayInvertRequested ? BLACK : WHITE);
   display.refresh();
 }
 
@@ -1081,9 +878,9 @@ bool otaInProgress = false;
 void drawOtaScreen(const char* msg) {
   displayOverride = true;
   displayOverrideUntil = millis() + 300000UL;  // dashboard neprekresli hlasku
-  clearCanvas();
-  drawCenteredText("Aktualizace FW", 70, 3);
-  drawCenteredText(msg, 120, 2);
+  const char* lines[] = {msg};
+  dashboard::message(display, "Aktualizace FW", lines, 1, inkColor(),
+                     appConfig.displayInvertRequested ? BLACK : WHITE);
   display.refresh();
 }
 

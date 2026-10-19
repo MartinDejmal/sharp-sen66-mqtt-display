@@ -30,8 +30,19 @@ Krabička pro 3D tisk je ke stažení na Printables:
 - Dashboard se všemi naměřenými hodnotami v reálném čase
 - Hodnocení kvality vzduchu s vizuálním ukazatelem podle PM2.5
 - Stavový řádek se stavem Wi-Fi, TMEP, MQTT a senzoru včetně doby běhu
+- Bezpatkové fonty U8g2 v nativních velikostech, česká diakritika a správné symboly jednotek
+- Teplota, vlhkost a CO₂ mají velké číslice vysoké 34 px; na šířku jsou vedle sebe, na výšku je CO₂ pod teplotou a vlhkostí. Prachové hodnoty, VOC a NOx zůstávají v kompaktní spodní části.
+- Inverzní upozornění „CO₂ · vyvětrat“ od 2 000 ppm; nepřipravené plynové hodnoty zobrazené pomlčkou
+- Rozložení pro otočení na šířku i na výšku, stejná typografie při startu a OTA aktualizaci
 - Vzdálené vykreslování textu a grafiky přes MQTT
 - Softwarová inverze barev (panel nemá hardwarovou inverzi)
+
+Fonty jsou uložené přímo ve firmwaru, bez dalších souborů na zařízení.
+Jejich zdroje, licence a postup opětovného generování jsou v
+[src/fonts/README.md](src/fonts/README.md). Hostitelské vykreslovací testy lze
+po `pio pkg install` spustit přes `python scripts/test_display.py`; vyžadují
+kompilátor C++ (GCC, Clang nebo MSVC). Náhledy vzniknou v `.pio/display-tests/`.
+S nainstalovaným Pillow se kromě PBM vytvoří i PNG.
 
 ### Integrace do Home Assistantu
 
