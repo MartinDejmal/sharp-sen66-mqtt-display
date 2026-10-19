@@ -3,9 +3,9 @@
  *  Sharp Memory LCD + SEN66 Sensor + MQTT (Home Assistant)
  *  ESP32-C3-MINI1 | PlatformIO + Arduino Framework
  * ============================================================
- *  Verze: 2.0.0
- *  Datum: 2026-02-13
- * 
+ *  Verze: 2.2.0
+ *  Datum: 2026-08-11
+ *
  *  Piny:
  *    SPI (displej): CLK=6, MOSI=7, MISO=2, CS=3
  *    I2C (SEN66):   SDA=10, SCL=8
@@ -25,14 +25,16 @@
 #include "config.h"
 #include "WifiProvisioning.h"
 
+#define FW_VERSION "2.2.0"
+
 // =============================================
-//  KONFIGURACE - UPRAVTE PODLE POTŘEBY
+//  HARDWARE
 // =============================================
 
 // SPI piny (Sharp LCD)
 #define PIN_SPI_CLK   6
 #define PIN_SPI_MOSI  7
-#define PIN_SPI_MISO  2   // nepoužitý - displej je write-only
+#define PIN_SPI_MISO  2   // nepouzity - displej je write-only
 #define PIN_SPI_CS    3
 
 // I2C piny (SEN66)
@@ -46,59 +48,73 @@
 #define WHITE 1
 
 // Intervaly (ms)
-#define SENSOR_READ_INTERVAL   2000   // čtení senzoru každé 2s
+#define SENSOR_READ_INTERVAL     2000
 #define MQTT_RECONNECT_INTERVAL  5000
 
 // =============================================
-//  MQTT TOPICS
+//  GLOBALNI OBJEKTY
 // =============================================
 
-// Příchozí (subscribe)
-#define TOPIC_TEXT       "sharp/display/text"
-#define TOPIC_CLEAR      "sharp/display/clear"
-#define TOPIC_COMMAND    "sharp/display/command"
-#define TOPIC_BRIGHTNESS "sharp/display/brightness"
-
-// Odchozí (publish)
-#define TOPIC_STATUS     "sharp/status"
-#define TOPIC_SENSOR     "sharp/sensor"     // JSON se všemi hodnotami
-#define TOPIC_TEMP       "sharp/sensor/temperature"
-#define TOPIC_HUMIDITY   "sharp/sensor/humidity"
-#define TOPIC_PM1        "sharp/sensor/pm1"
-#define TOPIC_PM25       "sharp/sensor/pm25"
-#define TOPIC_PM4        "sharp/sensor/pm4"
-#define TOPIC_PM10       "sharp/sensor/pm10"
-#define TOPIC_VOC        "sharp/sensor/voc"
-#define TOPIC_NOX        "sharp/sensor/nox"
-#define TOPIC_CO2        "sharp/sensor/co2"
-
-// =============================================
-//  GLOBÁLNÍ OBJEKTY
-// =============================================
-
-Adafruit_SharpMem display(PIN_SPI_CLK, PIN_SPI_MOSI, PIN_SPI_CS, 
-                           DISPLAY_WIDTH, DISPLAY_HEIGHT);
+Adafruit_SharpMem display(PIN_SPI_CLK, PIN_SPI_MOSI, PIN_SPI_CS,
+                          DISPLAY_WIDTH, DISPLAY_HEIGHT);
 SensirionI2cSen66 sen66;
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 WebServer webServer(80);
 WifiProvisioning wifiProvisioning;
 
+AppConfig appConfig;
+
+// =============================================
+//  MQTT TOPICS (skladaji se za behu z mqttBaseTopic)
+// =============================================
+
+String deviceId;  // posledni 3 byty MAC, napr. "a1b2c3"
+
+String topicText, topicClear, topicCommand;
+String topicStatus, topicSensor;
+String topicTemp, topicHumidity, topicPm1, topicPm25, topicPm4, topicPm10;
+String topicVoc, topicNox, topicCo2;
+String topicHaStatus;
+
+void buildTopics() {
+  const String& b = appConfig.mqttBaseTopic;
+
+  topicText     = b + "/display/text";
+  topicClear    = b + "/display/clear";
+  topicCommand  = b + "/display/command";
+
+  topicStatus   = b + "/status";
+  topicSensor   = b + "/sensor";
+  topicTemp     = b + "/sensor/temperature";
+  topicHumidity = b + "/sensor/humidity";
+  topicPm1      = b + "/sensor/pm1";
+  topicPm25     = b + "/sensor/pm25";
+  topicPm4      = b + "/sensor/pm4";
+  topicPm10     = b + "/sensor/pm10";
+  topicVoc      = b + "/sensor/voc";
+  topicNox      = b + "/sensor/nox";
+  topicCo2      = b + "/sensor/co2";
+
+  topicHaStatus = appConfig.haPrefix + "/status";
+}
+
 // =============================================
 //  DATA SENZORU
 // =============================================
 
 struct SensorData {
-  float pm1   = 0.0;
-  float pm25  = 0.0;
-  float pm4   = 0.0;
-  float pm10  = 0.0;
-  float temperature = 0.0;
-  float humidity    = 0.0;
-  float voc   = 0.0;
-  float nox   = 0.0;
+  float pm1   = 0.0f;
+  float pm25  = 0.0f;
+  float pm4   = 0.0f;
+  float pm10  = 0.0f;
+  float temperature = 0.0f;
+  float humidity    = 0.0f;
+  float voc   = 0.0f;
+  float nox   = 0.0f;
   uint16_t co2 = 0;
-  bool valid = false;
+  bool valid    = false;   // teplota / vlhkost / PM / VOC / NOx
+  bool co2Valid = false;   // CO2 se validuje zvlast (nabiha pozdeji)
 } sensorData;
 
 // =============================================
@@ -114,11 +130,9 @@ unsigned long firstValidSensorAt = 0;
 
 String lastTmepStatus = "TMEP:---";
 
-AppConfig appConfig;
-
 bool sen66Ready = false;
-bool displayOverride = false;       // true = zobrazuje custom text z MQTT
-unsigned long displayOverrideUntil = 0; // kdy přepnout zpět na senzory
+bool displayOverride = false;
+unsigned long displayOverrideUntil = 0;
 
 String overrideText = "";
 int overrideTextSize = 2;
@@ -126,34 +140,28 @@ int overrideX = 10;
 int overrideY = 10;
 
 // =============================================
-//  DISPLAY - POMOCNÉ FUNKCE
+//  DISPLAY - BARVY A POMOCNE FUNKCE
 // =============================================
 
+// Sharp Memory LCD nema HW inverzi, delame ji softwarove prohozenim barev.
+static inline uint16_t inkColor() {
+  return appConfig.displayInvertRequested ? WHITE : BLACK;
+}
+
+void clearCanvas() {
+  display.clearDisplay();
+  if (appConfig.displayInvertRequested) {
+    display.fillRect(0, 0, display.width(), display.height(), BLACK);
+  }
+  display.setTextColor(inkColor());
+}
 
 void applyDisplaySettings() {
   display.setRotation(appConfig.displayRotation % 4);
-  if (appConfig.displayInvertRequested) {
-    Serial.println("Display: Inverze je pozadovana, HW inverze neni na Sharp LCD podporovana.");
-  }
-}
-
-bool sensorValuesLookValid(const float pm1, const float pm25, const float pm4, const float pm10,
-                           const float hum, const float temp, const float voc, const float nox,
-                           const uint16_t co2) {
-  if (isnan(pm1) || isnan(pm25) || isnan(pm4) || isnan(pm10) || isnan(hum) || isnan(temp) ||
-      isnan(voc) || isnan(nox)) return false;
-
-  if (temp < -40.0f || temp > 85.0f) return false;
-  if (hum < 0.0f || hum > 100.0f) return false;
-  if (pm1 < 0.0f || pm1 > 1000.0f) return false;
-  if (pm25 < 0.0f || pm25 > 1000.0f) return false;
-  if (pm4 < 0.0f || pm4 > 1000.0f) return false;
-  if (pm10 < 0.0f || pm10 > 1000.0f) return false;
-  if (voc < 0.0f || voc > 500.0f) return false;
-  if (nox < 0.0f || nox > 500.0f) return false;
-  if (co2 < 350 || co2 > 10000) return false;
-
-  return true;
+  display.setTextColor(inkColor());
+  Serial.printf("Display: rotace=%u, inverze=%s\n",
+                appConfig.displayRotation % 4,
+                appConfig.displayInvertRequested ? "ano (SW)" : "ne");
 }
 
 void drawCenteredText(const char* text, int y, int textSize) {
@@ -161,7 +169,7 @@ void drawCenteredText(const char* text, int y, int textSize) {
   int16_t x1, y1;
   uint16_t w, h;
   display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
-  display.setCursor((DISPLAY_WIDTH - w) / 2, y);
+  display.setCursor((DISPLAY_WIDTH - (int)w) / 2, y);
   display.print(text);
 }
 
@@ -170,38 +178,68 @@ void drawRightAlignedText(const char* text, int y, int textSize) {
   int16_t x1, y1;
   uint16_t w, h;
   display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
-  display.setCursor(DISPLAY_WIDTH - w - 5, y);
+  display.setCursor(DISPLAY_WIDTH - (int)w - 5, y);
   display.print(text);
 }
 
 void drawDividerLine(int y) {
-  display.drawLine(5, y, DISPLAY_WIDTH - 5, y, BLACK);
+  display.drawLine(5, y, DISPLAY_WIDTH - 5, y, inkColor());
 }
 
-// Ikona teploměru (jednoduchý symbol)
+// Ikona teplomeru
 void drawThermIcon(int x, int y) {
-  display.drawCircle(x + 3, y + 12, 4, BLACK);
-  display.drawRect(x + 1, y, 5, 12, BLACK);
-  display.fillCircle(x + 3, y + 12, 3, BLACK);
+  display.drawCircle(x + 3, y + 12, 4, inkColor());
+  display.drawRect(x + 1, y, 5, 12, inkColor());
+  display.fillCircle(x + 3, y + 12, 3, inkColor());
 }
 
 // Ikona kapky (vlhkost)
 void drawDropIcon(int x, int y) {
-  display.drawPixel(x + 3, y, BLACK);
-  display.drawLine(x + 2, y + 1, x + 4, y + 1, BLACK);
-  display.drawLine(x + 1, y + 2, x + 5, y + 2, BLACK);
-  display.drawLine(x, y + 3, x + 6, y + 3, BLACK);
-  display.drawLine(x, y + 4, x + 6, y + 4, BLACK);
-  display.drawLine(x, y + 5, x + 6, y + 5, BLACK);
-  display.drawLine(x + 1, y + 6, x + 5, y + 6, BLACK);
-  display.drawLine(x + 2, y + 7, x + 4, y + 7, BLACK);
+  const uint16_t c = inkColor();
+  display.drawPixel(x + 3, y, c);
+  display.drawLine(x + 2, y + 1, x + 4, y + 1, c);
+  display.drawLine(x + 1, y + 2, x + 5, y + 2, c);
+  display.drawLine(x, y + 3, x + 6, y + 3, c);
+  display.drawLine(x, y + 4, x + 6, y + 4, c);
+  display.drawLine(x, y + 5, x + 6, y + 5, c);
+  display.drawLine(x + 1, y + 6, x + 5, y + 6, c);
+  display.drawLine(x + 2, y + 7, x + 4, y + 7, c);
 }
 
 // =============================================
-//  DISPLAY - HLAVNÍ OBRAZOVKY
+//  VALIDACE DAT SENZORU
 // =============================================
 
-// Hodnocení kvality vzduchu podle PM2.5
+static inline bool inRange(float v, float lo, float hi) {
+  return !isnan(v) && v >= lo && v <= hi;
+}
+
+// Teplota/vlhkost/PM/VOC/NOx. CO2 se resi zvlast, protoze nabiha az po ~1 minute
+// a driv vraci 0 nebo 0xFFFF - drive to shodilo cely vzorek vcetne teploty.
+bool coreValuesLookValid(float pm1, float pm25, float pm4, float pm10,
+                         float hum, float temp, float voc, float nox) {
+  if (!inRange(temp, -40.0f, 85.0f)) return false;
+  if (!inRange(hum, 0.0f, 100.0f)) return false;
+  if (!inRange(pm1, 0.0f, 1000.0f)) return false;
+  if (!inRange(pm25, 0.0f, 1000.0f)) return false;
+  if (!inRange(pm4, 0.0f, 1000.0f)) return false;
+  if (!inRange(pm10, 0.0f, 1000.0f)) return false;
+  if (!inRange(voc, 0.0f, 500.0f)) return false;
+  if (!inRange(nox, 0.0f, 500.0f)) return false;
+  return true;
+}
+
+// SEN66 vraci 0xFFFF, dokud CO2 neni k dispozici. Merici rozsah je 400-5000 ppm,
+// dolni mez volime 300 kvuli ASC kalibraci, horni 10000 kvuli spickam.
+bool co2LooksValid(uint16_t co2) {
+  return co2 >= 300 && co2 <= 10000;
+}
+
+// =============================================
+//  DISPLAY - HLAVNI OBRAZOVKY
+// =============================================
+
+// Hodnoceni kvality vzduchu podle PM2.5
 const char* getAirQuality(float pm25) {
   if (pm25 < 12.0)  return "VYNIKAJICI";
   if (pm25 < 35.4)  return "DOBRE";
@@ -211,61 +249,55 @@ const char* getAirQuality(float pm25) {
   return "NEBEZPECNE";
 }
 
-// Hlavní obrazovka se senzory
 void drawSensorScreen() {
-  display.clearDisplay();
-  display.setTextColor(BLACK);
-  
+  clearCanvas();
+
   char buf[64];
-  
-  // === STATUS BAR (y=0..22) ===
+
+  // === STATUS BAR ===
   display.setTextSize(1);
-  
-  // WiFi status
+
   if (WiFi.status() == WL_CONNECTED) {
     snprintf(buf, sizeof(buf), "WiFi:%s", WiFi.localIP().toString().c_str());
+  } else if (wifiProvisioning.isCaptiveMode()) {
+    snprintf(buf, sizeof(buf), "AP:%s", wifiProvisioning.getApIp().c_str());
   } else {
     snprintf(buf, sizeof(buf), "WiFi:---");
   }
   display.setCursor(5, 5);
   display.print(buf);
-  
-  // TMEP status
+
   display.setCursor(165, 5);
   display.print(lastTmepStatus);
 
-  // MQTT status
   display.setCursor(240, 5);
   display.print(mqtt.connected() ? "MQTT:OK" : "MQTT:---");
-  
-  // SEN66 status
+
   display.setCursor(315, 5);
   display.print(sen66Ready ? "SEN66:OK" : "SEN66:---");
-  
-  // Uptime
+
   unsigned long uptimeSec = millis() / 1000;
   unsigned long hrs = uptimeSec / 3600;
   unsigned long mins = (uptimeSec % 3600) / 60;
   snprintf(buf, sizeof(buf), "%luh%02lum", hrs, mins);
   drawRightAlignedText(buf, 5, 1);
-  
+
   drawDividerLine(18);
-  
+
   if (!sensorData.valid) {
     drawCenteredText("Cekam na data", 80, 2);
     drawCenteredText("ze senzoru SEN66...", 110, 2);
     display.refresh();
     return;
   }
-  
-  // === TEPLOTA & VLHKOST (y=24..80) ===
-  // Teplota - velký font
+
+  // === TEPLOTA & VLHKOST ===
   drawThermIcon(15, 28);
   snprintf(buf, sizeof(buf), "%.1f", sensorData.temperature);
   display.setTextSize(4);
   display.setCursor(35, 25);
   display.print(buf);
-  // Stupně C menším fontem
+
   int16_t x1, y1;
   uint16_t w, h;
   display.getTextBounds(buf, 35, 25, &x1, &y1, &w, &h);
@@ -274,8 +306,7 @@ void drawSensorScreen() {
   display.print("o");
   display.setCursor(35 + w + 5, 40);
   display.print("C");
-  
-  // Vlhkost - velký font
+
   drawDropIcon(220, 28);
   snprintf(buf, sizeof(buf), "%.1f", sensorData.humidity);
   display.setTextSize(4);
@@ -285,12 +316,11 @@ void drawSensorScreen() {
   display.setTextSize(2);
   display.setCursor(240 + w + 5, 30);
   display.print("%");
-  
+
   drawDividerLine(68);
-  
-  // === PM HODNOTY (y=72..140) ===
+
+  // === PM HODNOTY ===
   display.setTextSize(1);
-  // Záhlaví
   display.setCursor(15, 74);
   display.print("PM1.0");
   display.setCursor(115, 74);
@@ -299,39 +329,34 @@ void drawSensorScreen() {
   display.print("PM4.0");
   display.setCursor(315, 74);
   display.print("PM10");
-  
-  // Hodnoty - větší font
+
   display.setTextSize(3);
   snprintf(buf, sizeof(buf), "%.0f", sensorData.pm1);
   display.setCursor(10, 90);
   display.print(buf);
-  
+
   snprintf(buf, sizeof(buf), "%.0f", sensorData.pm25);
   display.setCursor(110, 90);
   display.print(buf);
-  
+
   snprintf(buf, sizeof(buf), "%.0f", sensorData.pm4);
   display.setCursor(210, 90);
   display.print(buf);
-  
+
   snprintf(buf, sizeof(buf), "%.0f", sensorData.pm10);
   display.setCursor(310, 90);
   display.print(buf);
-  
-  // Jednotky
+
   display.setTextSize(1);
-  display.setCursor(15, 118);
-  display.print("ug/m3");
-  display.setCursor(115, 118);
-  display.print("ug/m3");
-  display.setCursor(215, 118);
-  display.print("ug/m3");
-  display.setCursor(315, 118);
-  display.print("ug/m3");
-  
+  static const int pmUnitX[4] = {15, 115, 215, 315};
+  for (uint8_t i = 0; i < 4; i++) {
+    display.setCursor(pmUnitX[i], 118);
+    display.print("ug/m3");
+  }
+
   drawDividerLine(132);
-  
-  // === VOC, NOx, CO2 (y=136..200) ===
+
+  // === VOC, NOx, CO2 ===
   display.setTextSize(1);
   display.setCursor(15, 138);
   display.print("VOC Index");
@@ -339,77 +364,80 @@ void drawSensorScreen() {
   display.print("NOx Index");
   display.setCursor(295, 138);
   display.print("CO2");
-  
+
   display.setTextSize(3);
   snprintf(buf, sizeof(buf), "%.0f", sensorData.voc);
   display.setCursor(15, 152);
   display.print(buf);
-  
+
   snprintf(buf, sizeof(buf), "%.0f", sensorData.nox);
   display.setCursor(155, 152);
   display.print(buf);
-  
-  snprintf(buf, sizeof(buf), "%u", sensorData.co2);
+
+  if (sensorData.co2Valid) {
+    snprintf(buf, sizeof(buf), "%u", sensorData.co2);
+  } else {
+    snprintf(buf, sizeof(buf), "---");
+  }
   display.setCursor(280, 152);
   display.print(buf);
-  
+
   display.setTextSize(1);
   display.setCursor(350, 170);
   display.print("ppm");
-  
+
   drawDividerLine(185);
-  
-  // === AIR QUALITY BAR (y=190..235) ===
+
+  // === AIR QUALITY BAR ===
   const char* quality = getAirQuality(sensorData.pm25);
   display.setTextSize(1);
   display.setCursor(15, 192);
   display.print("Kvalita vzduchu:");
-  
+
   display.setTextSize(3);
   display.setCursor(15, 208);
   display.print(quality);
-  
-  // Indikátor bar
+
   float barValue = min(sensorData.pm25 / 150.0f, 1.0f);
   int barWidth = (int)(barValue * 120);
-  display.drawRect(270, 200, 122, 24, BLACK);
-  display.fillRect(271, 201, barWidth, 22, BLACK);
-  
+  display.drawRect(270, 200, 122, 24, inkColor());
+  if (barWidth > 0) display.fillRect(271, 201, barWidth, 22, inkColor());
+
   display.refresh();
 }
 
-// Obrazovka s custom textem (z MQTT)
 void drawCustomTextScreen() {
-  display.clearDisplay();
-  display.setTextColor(BLACK);
+  clearCanvas();
   display.setTextSize(overrideTextSize);
   display.setCursor(overrideX, overrideY);
   display.println(overrideText);
   display.refresh();
 }
 
-// Boot/splash screen
 void drawSplashScreen() {
-  display.clearDisplay();
-  display.setTextColor(BLACK);
-  
+  clearCanvas();
+
   drawCenteredText("Sharp LCD + SEN66", 40, 3);
   drawCenteredText("MQTT Dashboard", 80, 2);
-  
+
   drawDividerLine(110);
-  
+
   display.setTextSize(1);
   display.setCursor(30, 125);
-  display.print("WiFi: ");
-  display.print(appConfig.wifiSsid);
-  
+  display.print("FW:   ");
+  display.print(FW_VERSION);
+
   display.setCursor(30, 140);
+  display.print("WiFi: ");
+  display.print(appConfig.wifiSsid.length() ? appConfig.wifiSsid : String("(nenastaveno)"));
+
+  display.setCursor(30, 155);
   display.print("MQTT: ");
-  display.print(appConfig.mqttServer);
-  
-  display.setCursor(30, 160);
+  display.print(appConfig.mqttServer.length() ? appConfig.mqttServer : String("(nenastaveno)"));
+
+  display.setCursor(30, 175);
   display.print("Inicializace...");
-  
+
   display.refresh();
 }
 
@@ -425,9 +453,9 @@ void drawSplashScreen() {
 void initSEN66() {
   Serial.println("SEN66: Inicializace I2C...");
   Wire.begin(PIN_SDA, PIN_SCL);
-  
+
   sen66.begin(Wire, SEN66_I2C_ADDR_6B);
-  
+
   int16_t error = sen66.deviceReset();
   if (error != NO_ERROR) {
     char msg[64];
@@ -436,10 +464,9 @@ void initSEN66() {
     sen66Ready = false;
     return;
   }
-  
-  delay(1200); // SEN66 potřebuje čas po resetu
-  
-  // Přečíst sériové číslo
+
+  delay(1200);  // SEN66 potrebuje cas po resetu
+
   int8_t serialNumber[32] = {0};
   error = sen66.getSerialNumber(serialNumber, 32);
   if (error != NO_ERROR) {
@@ -449,8 +476,7 @@ void initSEN66() {
   } else {
     Serial.printf("SEN66: S/N: %s\n", (const char*)serialNumber);
   }
-  
-  // Spustit měření
+
   error = sen66.startContinuousMeasurement();
   if (error != NO_ERROR) {
     char msg[64];
@@ -459,34 +485,32 @@ void initSEN66() {
     sen66Ready = false;
     return;
   }
-  
+
   sen66Ready = true;
   Serial.println("SEN66: OK, mereni spusteno!");
 }
 
 void readSEN66() {
   if (!sen66Ready) return;
-  
+
   float pm1, pm25, pm4, pm10, hum, temp, voc, nox;
   uint16_t co2;
-  
+
   int16_t error = sen66.readMeasuredValues(
-    pm1, pm25, pm4, pm10, hum, temp, voc, nox, co2
-  );
-  
+      pm1, pm25, pm4, pm10, hum, temp, voc, nox, co2);
+
   if (error != NO_ERROR) {
     char msg[64];
     errorToString(error, msg, sizeof(msg));
     Serial.printf("SEN66: readMeasuredValues() CHYBA: %s\n", msg);
     return;
   }
-  
-  // Kontrola platnosti (SEN66 vrací NaN/0xFFFF při inicializaci)
-  if (!sensorValuesLookValid(pm1, pm25, pm4, pm10, hum, temp, voc, nox, co2)) {
-    Serial.println("SEN66: namerena neplatna data, preskakuji");
+
+  if (!coreValuesLookValid(pm1, pm25, pm4, pm10, hum, temp, voc, nox)) {
+    Serial.println("SEN66: neplatna data (T/H/PM/VOC/NOx), vzorek preskocen");
     return;
   }
-  
+
   sensorData.pm1  = pm1;
   sensorData.pm25 = pm25;
   sensorData.pm4  = pm4;
@@ -495,14 +519,25 @@ void readSEN66() {
   sensorData.humidity    = hum;
   sensorData.voc  = voc;
   sensorData.nox  = nox;
-  sensorData.co2  = co2;
   sensorData.valid = true;
+
+  if (co2LooksValid(co2)) {
+    sensorData.co2 = co2;
+    sensorData.co2Valid = true;
+  } else {
+    sensorData.co2Valid = false;
+  }
+
   if (firstValidSensorAt == 0) firstValidSensorAt = millis();
-  
-  Serial.printf("SEN66: T(raw)=%.1f T(adj)=%.1f H=%.1f PM2.5=%.1f VOC=%.0f NOx=%.0f CO2=%u\n",
-    temp, sensorData.temperature, hum, pm25, voc, nox, co2);
+
+  Serial.printf("SEN66: T(raw)=%.1f T(adj)=%.1f H=%.1f PM2.5=%.1f VOC=%.0f NOx=%.0f CO2=%s\n",
+                temp, sensorData.temperature, hum, pm25, voc, nox,
+                sensorData.co2Valid ? String(sensorData.co2).c_str() : "n/a");
 }
 
+// =============================================
+//  TMEP.CZ
+// =============================================
 
 String formatFloat1(const float value) {
   char buf[16];
@@ -524,6 +559,7 @@ void replaceAllTokens(String& target, const String& token, const String& value) 
 String buildTmepQueryParams() {
   String params = appConfig.tmepParams;
 
+  // Hodnoty ze senzoru
   replaceAllTokens(params, "TEMP", formatFloat1(sensorData.temperature));
   replaceAllTokens(params, "HUM", formatFloat1(sensorData.humidity));
   replaceAllTokens(params, "PM1", formatFloat1(sensorData.pm1));
@@ -532,20 +568,27 @@ String buildTmepQueryParams() {
   replaceAllTokens(params, "PM10", formatFloat1(sensorData.pm10));
   replaceAllTokens(params, "VOC", formatFloat0(sensorData.voc));
   replaceAllTokens(params, "NOX", formatFloat0(sensorData.nox));
-  replaceAllTokens(params, "CO2", String(sensorData.co2));
+  replaceAllTokens(params, "CO2", sensorData.co2Valid ? String(sensorData.co2) : String(""));
+
+  // Systemove hodnoty (README je dokumentoval, implementace chybela)
+  replaceAllTokens(params, "RSSI", WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String(""));
+  replaceAllTokens(params, "UPTIME", String(millis() / 1000));
+  replaceAllTokens(params, "FREEHEAP", String(ESP.getFreeHeap()));
+  replaceAllTokens(params, "IP", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String(""));
 
   return params;
 }
 
 String buildTmepRequestUrl() {
-  if (appConfig.tmepDomain.length() == 0 || appConfig.tmepParams.length() == 0 || !sensorData.valid) return "";
+  if (appConfig.tmepDomain.length() == 0 || appConfig.tmepParams.length() == 0 || !sensorData.valid) {
+    return "";
+  }
   return "http://" + appConfig.tmepDomain + ".tmep.cz/?" + buildTmepQueryParams();
 }
 
 bool sendTmepRequest(const bool manualTrigger) {
   if (appConfig.tmepDomain.length() == 0 || appConfig.tmepParams.length() == 0) {
-    Serial.println("TMEP: domena nebo parametry nejsou nastaveny, request preskocen");
-    lastTmepStatus = "TMEP:SKIP";
+    lastTmepStatus = "TMEP:OFF";
     return false;
   }
   if (!sensorData.valid) {
@@ -566,6 +609,7 @@ bool sendTmepRequest(const bool manualTrigger) {
   }
 
   HTTPClient http;
+  http.setConnectTimeout(5000);
   http.setTimeout(5000);
   if (!http.begin(url)) {
     Serial.println("TMEP: Nelze inicializovat HTTP request");
@@ -578,18 +622,42 @@ bool sendTmepRequest(const bool manualTrigger) {
   http.end();
 
   if (httpCode > 0 && httpCode < 400) {
-    Serial.printf("TMEP: %srequest OK, HTTP %d, URL: %s\n", manualTrigger ? "manual " : "", httpCode, url.c_str());
+    Serial.printf("TMEP: %srequest OK, HTTP %d\n", manualTrigger ? "manual " : "", httpCode);
     lastTmepStatus = "TMEP:OK";
     return true;
   }
 
-  Serial.printf("TMEP: %srequest CHYBA, HTTP %d, URL: %s, body: %s\n",
-    manualTrigger ? "manual " : "", httpCode, url.c_str(), response.c_str());
+  Serial.printf("TMEP: %srequest CHYBA, HTTP %d, body: %s\n",
+                manualTrigger ? "manual " : "", httpCode, response.c_str());
   lastTmepStatus = "TMEP:ERR";
   return false;
 }
 
+// =============================================
+//  WEB SERVER
+// =============================================
+
+// V captive rezimu autentizaci nevyzadujeme, jinak by se uzivatel nedostal
+// k prvotnimu nastaveni. V STA rezimu chrani heslo, pokud je nastavene.
+bool requireAuth() {
+  if (wifiProvisioning.isCaptiveMode()) return false;
+  if (appConfig.webPassword.length() == 0) return false;
+  if (!webServer.authenticate(appConfig.webUser.c_str(), appConfig.webPassword.c_str())) {
+    webServer.requestAuthentication();
+    return true;
+  }
+  return false;
+}
+
+void sendJson(int code, JsonDocument& doc) {
+  String payload;
+  serializeJson(doc, payload);  // String roste dle potreby, nic se neorizne
+  webServer.send(code, "application/json", payload);
+}
+
 void handleWebRoot() {
+  if (requireAuth()) return;
+
   const char* html = R"HTML(
 <!doctype html><html lang="cs"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SEN66 panel</title>
 <style>
@@ -597,49 +665,60 @@ body{font-family:Arial,sans-serif;margin:0;background:#f3f5f7;color:#222}header{
 .tabs{display:flex;gap:8px;margin-bottom:12px}.tab{padding:10px 14px;border:0;border-radius:8px;background:#dbe2ea;cursor:pointer}.tab.active{background:#2563eb;color:#fff}
 .panel{display:none;background:#fff;padding:16px;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.15)}.panel.active{display:block}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}.card{border:1px solid #e5e7eb;border-radius:8px;padding:10px}
-label{display:block;font-size:.9rem;margin-top:8px}input{width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px}
+label{display:block;font-size:14px;margin-top:8px}input{width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;box-sizing:border-box}
 button.save,button.secondary,button.warn{margin-top:12px;padding:10px 14px;color:#fff;border:0;border-radius:8px;cursor:pointer}
 button.save{background:#16a34a}button.secondary{background:#2563eb}button.warn{background:#b91c1c}
-.muted{color:#666;font-size:.85rem}.ok{color:#166534}.err{color:#b91c1c}code.url{display:block;padding:8px;background:#f1f5f9;border-radius:6px;word-break:break-all}
+.muted{color:#666;font-size:13px}.ok{color:#166534}.err{color:#b91c1c}code.url{display:block;padding:8px;background:#f1f5f9;border-radius:6px;word-break:break-all;font-size:13px}
 </style></head><body><header><h2>SEN66 MQTT displej</h2></header><main>
 <div class="tabs"><button class="tab active" data-tab="data">Aktuální data</button><button class="tab" data-tab="cfg">Konfigurace</button></div>
 <section id="data" class="panel active"><div class="grid" id="cards"></div><p class="muted" id="status"></p></section>
-<section id="cfg" class="panel"><form id="cfgForm"><h3>Wi-Fi setup</h3>
+<section id="cfg" class="panel"><form id="cfgForm"><h3>Wi-Fi</h3>
 <p class="muted" id="wifiMode"></p><p class="muted" id="wifiConn"></p>
 <label>SSID<input name="wifiSsid" required></label>
-<label>Heslo<input type="password" name="wifiPassword" id="wifiPass"></label>
+<label>Heslo<input type="password" name="wifiPassword" id="wifiPass" placeholder="(beze změny)"></label>
 <label><input id="showPass" type="checkbox" style="width:auto"> Zobrazit heslo</label>
-<button id="wifiOnlySaveBtn" class="secondary" type="button">Uložit jen Wi-Fi a připojit</button>
+<button id="wifiOnlySaveBtn" class="secondary" type="button">Uložit jen Wi-Fi a restartovat</button>
 <button id="wifiForgetBtn" class="warn" type="button">Zapomenout Wi-Fi</button><p class="muted" id="wifiMsg"></p>
-<h3>MQTT</h3><label>Server<input name="mqttServer" required></label><label>Port<input type="number" min="1" max="65535" name="mqttPort" required></label><label>Uživatel<input name="mqttUser"></label><label>Heslo<input type="password" name="mqttPassword"></label>
+<h3>MQTT</h3><label>Server<input name="mqttServer" placeholder="192.168.1.10"></label><label>Port<input type="number" min="1" max="65535" name="mqttPort" required></label><label>Uživatel<input name="mqttUser"></label><label>Heslo<input type="password" name="mqttPassword" placeholder="(beze změny)"></label>
+<label>Client ID<input name="mqttClientId"></label><label>Base topic<input name="mqttBaseTopic" placeholder="sharp"></label><label>Discovery prefix Home Assistantu<input name="haPrefix" placeholder="homeassistant"></label>
+<h3>Zabezpečení web UI</h3><label>Uživatel<input name="webUser" placeholder="admin"></label><label>Heslo (prázdné pole = beze změny)<input type="password" name="webPassword" placeholder="(beze změny)"></label>
 <h3>TMEP.cz</h3><label>Doména pro zasílání hodnot<input name="tmepDomain" placeholder="xxk4sk-g6rxfh"></label><label>Parametry požadavku<input name="tmepParams" placeholder="tempV=*TEMP*&humV=*HUM*&co2=*CO2*"></label>
-<p class="muted">Použitelné proměnné: *TEMP*, *HUM*, *PM1*, *PM2*, *PM4*, *PM10*, *VOC*, *NOX*, *CO2*.</p><p class="muted">Reálné URL volané na TMEP.cz:</p><code id="tmepUrl" class="url muted">Není dostupné</code>
+<p class="muted">Proměnné: *TEMP*, *HUM*, *PM1*, *PM2*, *PM4*, *PM10*, *VOC*, *NOX*, *CO2*, *RSSI*, *UPTIME*, *FREEHEAP*, *IP*.</p><p class="muted">Reálné URL volané na TMEP.cz:</p><code id="tmepUrl" class="url muted">Není dostupné</code>
 <button id="tmepSendBtn" class="secondary" type="button">Odeslat TMEP request ručně</button><p id="tmepMsg" class="muted"></p>
 <h3>Displej</h3><label>Rotace (0-3)<input type="number" min="0" max="3" name="displayRotation" required></label><label>Inverze (0/1)<input type="number" min="0" max="1" name="displayInvertRequested" required></label>
-<h3>Intervaly (ms)</h3><label>Překreslení displeje<input type="number" min="500" name="displayRefreshInterval" required></label><label>MQTT publish<input type="number" min="1000" name="mqttPublishInterval" required></label><label>TMEP request interval<input type="number" min="1000" name="tmepRequestInterval" required></label><label>MQTT warmup delay<input type="number" min="1000" name="mqttWarmupDelay" required></label><label>Temperature offset<input type="number" step="0.1" name="temperatureOffset" required></label><p class="muted">hodnota, kterou přičíst k naměřené teplotě</p>
+<h3>Intervaly (ms)</h3><label>Překreslení displeje<input type="number" min="500" name="displayRefreshInterval" required></label><label>MQTT publish<input type="number" min="1000" name="mqttPublishInterval" required></label><label>TMEP request interval<input type="number" min="1000" name="tmepRequestInterval" required></label><label>MQTT warmup delay<input type="number" min="1000" name="mqttWarmupDelay" required></label>
+<h3>Kalibrace</h3><label>Teplotní offset (°C)<input type="number" step="0.1" min="-20" max="20" name="temperatureOffset" required></label><p class="muted">Hodnota se přičítá k naměřené teplotě.</p>
 <button class="save" type="submit">Uložit plnou konfiguraci</button><p id="cfgMsg" class="muted"></p></form></section></main>
 <script>
+const NUM=['mqttPort','displayRotation','displayInvertRequested','displayRefreshInterval','mqttPublishInterval','tmepRequestInterval','mqttWarmupDelay','temperatureOffset'];
 const tabs=document.querySelectorAll('.tab');tabs.forEach(t=>t.onclick=()=>{tabs.forEach(x=>x.classList.remove('active'));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));t.classList.add('active');document.getElementById(t.dataset.tab).classList.add('active')});
 function setMsg(id,text,ok){const m=document.getElementById(id);m.textContent=text;m.className=ok?'ok':'err'}
-async function loadData(){const r=await fetch('/api/data');const d=await r.json();const cards=document.getElementById('cards');cards.innerHTML='';for(const [k,v] of Object.entries(d.values)){const c=document.createElement('div');c.className='card';c.innerHTML=`<strong>${k}</strong><div>${v}</div>`;cards.appendChild(c)}
-document.getElementById('status').textContent=`WiFi: ${d.wifi} | režim: ${d.wifiMode} | TMEP: ${d.tmepStatus} | MQTT: ${d.mqtt} | validní data: ${d.valid} | uptime: ${d.uptime}s`;
-document.getElementById('wifiMode').textContent=`Režim: ${d.wifiMode} ${d.apSsid?('| AP: '+d.apSsid+' @ '+d.apIp):''}`;
-document.getElementById('wifiConn').textContent=`Aktuální SSID: ${d.currentSsid||'-'} | IP: ${d.currentIp||'-'} | RSSI: ${d.rssi||'-'} dBm`;
-const tmepUrlEl=document.getElementById('tmepUrl');tmepUrlEl.textContent=d.tmepUrl||'Není dostupné';tmepUrlEl.className=d.tmepUrl?'url':'url muted'}
-async function loadCfg(){const r=await fetch('/api/config');const c=await r.json();const f=document.getElementById('cfgForm');Object.keys(c).forEach(k=>{if(f[k])f[k].value=c[k]})}
-
+async function loadData(){try{const r=await fetch('/api/data');const d=await r.json();const cards=document.getElementById('cards');cards.innerHTML='';for(const [k,v] of Object.entries(d.values)){const c=document.createElement('div');c.className='card';const t=document.createElement('strong');t.textContent=k;const val=document.createElement('div');val.textContent=v;c.appendChild(t);c.appendChild(val);cards.appendChild(c)}
+document.getElementById('status').textContent='WiFi: '+d.wifi+' | režim: '+d.wifiMode+' | TMEP: '+d.tmepStatus+' | MQTT: '+d.mqtt+' | validní data: '+d.valid+' | uptime: '+d.uptime+' s | FW '+d.fw;
+document.getElementById('wifiMode').textContent='Režim: '+d.wifiMode+(d.apSsid?(' | AP: '+d.apSsid+' @ '+d.apIp):'');
+document.getElementById('wifiConn').textContent='Aktuální SSID: '+(d.currentSsid||'-')+' | IP: '+(d.currentIp||'-')+' | RSSI: '+(d.rssi||'-')+' dBm';
+const u=document.getElementById('tmepUrl');u.textContent=d.tmepUrl||'Není dostupné';u.className=d.tmepUrl?'url':'url muted'}catch(e){}}
+async function loadCfg(){const r=await fetch('/api/config');const c=await r.json();const f=document.getElementById('cfgForm');Object.keys(c).forEach(k=>{const el=f[k];if(el&&'value' in el)el.value=c[k]})}
+function buildPayload(f){const p=Object.fromEntries(new FormData(f).entries());
+NUM.forEach(k=>{if(p[k]!==undefined&&p[k]!=='')p[k]=Number(p[k]);else delete p[k]});
+['wifiPassword','mqttPassword','webPassword'].forEach(k=>{if(p[k]==='')delete p[k]});
+return p}
 document.getElementById('showPass').onchange=(e)=>{document.getElementById('wifiPass').type=e.target.checked?'text':'password'};
-document.getElementById('cfgForm').onsubmit=async(e)=>{e.preventDefault();const f=e.target;const payload=Object.fromEntries(new FormData(f).entries());const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});setMsg('cfgMsg',await r.text(),r.ok)};
-document.getElementById('wifiOnlySaveBtn').onclick=async()=>{const f=document.getElementById('cfgForm');const payload={wifiSsid:f.wifiSsid.value,wifiPassword:f.wifiPassword.value};const r=await fetch('/api/wifi/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json();setMsg('wifiMsg',d.message||'?',r.ok);await loadData()};
-document.getElementById('wifiForgetBtn').onclick=async()=>{const r=await fetch('/api/wifi/forget',{method:'POST'});const d=await r.json();setMsg('wifiMsg',d.message||'?',r.ok);};
+document.getElementById('cfgForm').onsubmit=async(e)=>{e.preventDefault();const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(buildPayload(e.target))});setMsg('cfgMsg',await r.text(),r.ok)};
+document.getElementById('wifiOnlySaveBtn').onclick=async()=>{const f=document.getElementById('cfgForm');const p={wifiSsid:f.wifiSsid.value};if(f.wifiPassword.value!=='')p.wifiPassword=f.wifiPassword.value;const r=await fetch('/api/wifi/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});const d=await r.json();setMsg('wifiMsg',d.message||'?',r.ok)};
+document.getElementById('wifiForgetBtn').onclick=async()=>{if(!confirm('Opravdu smazat uložené Wi-Fi údaje a restartovat do AP režimu?'))return;const r=await fetch('/api/wifi/forget',{method:'POST'});const d=await r.json();setMsg('wifiMsg',d.message||'?',r.ok)};
 document.getElementById('tmepSendBtn').onclick=async()=>{const r=await fetch('/api/tmep/send',{method:'POST'});setMsg('tmepMsg',await r.text(),r.ok);await loadData()};
 loadData();loadCfg();setInterval(loadData,2000);
 </script></body></html>)HTML";
+
   webServer.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleApiData() {
+  if (requireAuth()) return;
+
   JsonDocument doc;
+  doc["fw"] = FW_VERSION;
   doc["wifi"] = WiFi.status() == WL_CONNECTED ? "connected" : "disconnected";
   doc["mqtt"] = mqtt.connected() ? "connected" : "disconnected";
   doc["valid"] = sensorData.valid;
@@ -662,21 +741,27 @@ void handleApiData() {
   values["pm10"] = round(sensorData.pm10 * 10) / 10.0;
   values["voc"] = round(sensorData.voc);
   values["nox"] = round(sensorData.nox);
-  values["co2"] = sensorData.co2;
+  if (sensorData.co2Valid) {
+    values["co2"] = sensorData.co2;
+  } else {
+    values["co2"] = "---";
+  }
 
-  char payload[1024];
-  serializeJson(doc, payload, sizeof(payload));
-  webServer.send(200, "application/json", payload);
+  sendJson(200, doc);
 }
 
 void handleApiConfigGet() {
+  if (requireAuth()) return;
+
   JsonDocument doc;
   doc["wifiSsid"] = appConfig.wifiSsid;
-  doc["wifiPassword"] = appConfig.wifiPassword;
   doc["mqttServer"] = appConfig.mqttServer;
   doc["mqttPort"] = appConfig.mqttPort;
   doc["mqttUser"] = appConfig.mqttUser;
-  doc["mqttPassword"] = appConfig.mqttPassword;
+  doc["mqttClientId"] = appConfig.mqttClientId;
+  doc["mqttBaseTopic"] = appConfig.mqttBaseTopic;
+  doc["haPrefix"] = appConfig.haPrefix;
+  doc["webUser"] = appConfig.webUser;
   doc["tmepDomain"] = appConfig.tmepDomain;
   doc["tmepParams"] = appConfig.tmepParams;
   doc["displayRotation"] = appConfig.displayRotation;
@@ -687,12 +772,38 @@ void handleApiConfigGet() {
   doc["mqttWarmupDelay"] = appConfig.mqttWarmupDelay;
   doc["temperatureOffset"] = appConfig.temperatureOffset;
 
-  char payload[1024];
-  serializeJson(doc, payload, sizeof(payload));
-  webServer.send(200, "application/json", payload);
+  // Hesla se zasadne neposilaji zpet, jen priznak, zda jsou nastavena.
+  doc["wifiPasswordSet"] = appConfig.wifiPassword.length() > 0;
+  doc["mqttPasswordSet"] = appConfig.mqttPassword.length() > 0;
+  doc["webPasswordSet"] = appConfig.webPassword.length() > 0;
+
+  sendJson(200, doc);
+}
+
+// HTML formular posila vsechny hodnoty jako retezce. ArduinoJson 7 vraci
+// u `variant | default` default, pokud typ nesedi - proto explicitni prevod.
+template <typename T>
+T readNumber(JsonVariantConst v, T fallback) {
+  if (v.isNull()) return fallback;
+  if (v.is<T>()) return v.as<T>();
+  if (v.is<const char*>()) {
+    String s = v.as<String>();
+    s.trim();
+    if (s.length() == 0) return fallback;
+    return (T)s.toDouble();
+  }
+  if (v.is<float>()) return (T)v.as<float>();
+  return fallback;
+}
+
+String readString(JsonVariantConst v, const String& fallback) {
+  if (v.is<const char*>()) return v.as<String>();
+  return fallback;
 }
 
 void handleApiConfigPost() {
+  if (requireAuth()) return;
+
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, webServer.arg("plain"));
   if (err) {
@@ -701,24 +812,36 @@ void handleApiConfigPost() {
   }
 
   AppConfig updated = appConfig;
-  if (doc["wifiSsid"].is<const char*>()) updated.wifiSsid = doc["wifiSsid"].as<String>();
-  if (doc["wifiPassword"].is<const char*>()) updated.wifiPassword = doc["wifiPassword"].as<String>();
-  if (doc["mqttServer"].is<const char*>()) updated.mqttServer = doc["mqttServer"].as<String>();
-  if (doc["mqttUser"].is<const char*>()) updated.mqttUser = doc["mqttUser"].as<String>();
-  if (doc["mqttPassword"].is<const char*>()) updated.mqttPassword = doc["mqttPassword"].as<String>();
-  if (doc["mqttClientId"].is<const char*>()) updated.mqttClientId = doc["mqttClientId"].as<String>();
-  if (doc["tmepDomain"].is<const char*>()) updated.tmepDomain = doc["tmepDomain"].as<String>();
-  if (doc["tmepParams"].is<const char*>()) updated.tmepParams = doc["tmepParams"].as<String>();
 
-  updated.mqttPort = doc["mqttPort"] | updated.mqttPort;
-  updated.displayRotation = (uint8_t)(doc["displayRotation"] | updated.displayRotation);
-  int newInvert = doc["displayInvertRequested"] | (updated.displayInvertRequested ? 1 : 0);
-  updated.displayInvertRequested = (newInvert == 1);
-  updated.displayRefreshInterval = doc["displayRefreshInterval"] | updated.displayRefreshInterval;
-  updated.mqttPublishInterval = doc["mqttPublishInterval"] | updated.mqttPublishInterval;
-  updated.tmepRequestInterval = doc["tmepRequestInterval"] | updated.tmepRequestInterval;
-  updated.mqttWarmupDelay = doc["mqttWarmupDelay"] | updated.mqttWarmupDelay;
-  updated.temperatureOffset = doc["temperatureOffset"] | updated.temperatureOffset;
+  updated.wifiSsid      = readString(doc["wifiSsid"], updated.wifiSsid);
+  updated.mqttServer    = readString(doc["mqttServer"], updated.mqttServer);
+  updated.mqttUser      = readString(doc["mqttUser"], updated.mqttUser);
+  updated.mqttClientId  = readString(doc["mqttClientId"], updated.mqttClientId);
+  updated.mqttBaseTopic = readString(doc["mqttBaseTopic"], updated.mqttBaseTopic);
+  updated.haPrefix      = readString(doc["haPrefix"], updated.haPrefix);
+  updated.webUser       = readString(doc["webUser"], updated.webUser);
+  updated.tmepDomain    = readString(doc["tmepDomain"], updated.tmepDomain);
+  updated.tmepParams    = readString(doc["tmepParams"], updated.tmepParams);
+
+  // Hesla: klic nedorazi => beze zmeny, dorazi prazdny retezec => smazat.
+  if (!doc["wifiPassword"].isNull()) updated.wifiPassword = doc["wifiPassword"].as<String>();
+  if (!doc["mqttPassword"].isNull()) updated.mqttPassword = doc["mqttPassword"].as<String>();
+  if (!doc["webPassword"].isNull()) updated.webPassword = doc["webPassword"].as<String>();
+
+  updated.mqttPort        = readNumber<int>(doc["mqttPort"], updated.mqttPort);
+  updated.displayRotation = (uint8_t)readNumber<int>(doc["displayRotation"], updated.displayRotation);
+  updated.displayInvertRequested =
+      readNumber<int>(doc["displayInvertRequested"], updated.displayInvertRequested ? 1 : 0) != 0;
+  updated.displayRefreshInterval =
+      readNumber<unsigned long>(doc["displayRefreshInterval"], updated.displayRefreshInterval);
+  updated.mqttPublishInterval =
+      readNumber<unsigned long>(doc["mqttPublishInterval"], updated.mqttPublishInterval);
+  updated.tmepRequestInterval =
+      readNumber<unsigned long>(doc["tmepRequestInterval"], updated.tmepRequestInterval);
+  updated.mqttWarmupDelay =
+      readNumber<unsigned long>(doc["mqttWarmupDelay"], updated.mqttWarmupDelay);
+  updated.temperatureOffset =
+      readNumber<float>(doc["temperatureOffset"], updated.temperatureOffset);
 
   if (!validateConfig(updated)) {
     webServer.send(400, "text/plain", "Neplatne hodnoty konfigurace");
@@ -731,51 +854,68 @@ void handleApiConfigPost() {
   }
 
   appConfig = updated;
-  mqtt.setServer(appConfig.mqttServer.c_str(), appConfig.mqttPort);
-  applyDisplaySettings();
-
   webServer.send(200, "text/plain", "Konfigurace ulozena, zarizeni se restartuje...");
   delay(300);
   ESP.restart();
 }
 
 void handleApiWifiSave() {
+  if (requireAuth()) return;
+
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, webServer.arg("plain"));
+  JsonDocument out;
+
   if (err) {
-    webServer.send(400, "application/json", "{\"ok\":false,\"message\":\"Neplatny JSON\"}");
+    out["ok"] = false;
+    out["message"] = "Neplatny JSON";
+    sendJson(400, out);
     return;
   }
 
-  String ssid = doc["wifiSsid"].as<String>();
-  String password = doc["wifiPassword"].as<String>();
+  AppConfig updated = appConfig;
+  updated.wifiSsid = doc["wifiSsid"].as<String>();
+  if (!doc["wifiPassword"].isNull()) updated.wifiPassword = doc["wifiPassword"].as<String>();
 
-  String message;
-  bool ok = wifiProvisioning.saveCredentialsAndConnect(ssid, password, message);
-
-  JsonDocument out;
-  out["ok"] = ok;
-  out["message"] = message;
-  out["wifiMode"] = wifiProvisioning.getStateText();
-  String payload;
-  serializeJson(out, payload);
-  webServer.send(ok ? 200 : 400, "application/json", payload);
-
-  if (ok) {
-    delay(300);
-    ESP.restart();
+  if (updated.wifiSsid.length() == 0) {
+    out["ok"] = false;
+    out["message"] = "SSID nesmi byt prazdne";
+    sendJson(400, out);
+    return;
   }
+
+  if (!saveConfig(updated)) {
+    out["ok"] = false;
+    out["message"] = "Nepodarilo se ulozit WiFi konfiguraci";
+    sendJson(500, out);
+    return;
+  }
+
+  appConfig = updated;
+  out["ok"] = true;
+  out["message"] = "Wi-Fi ulozena, restartuji a pripojuji se";
+  sendJson(200, out);
+
+  // Odpovime driv, nez zacneme cokoli blokujiciho - drive se 20s pokus
+  // o pripojeni delal primo v handleru a prohlizeci vyprsel fetch.
+  delay(300);
+  ESP.restart();
 }
 
 void handleApiWifiForget() {
-  bool ok = wifiProvisioning.forgetCredentials();
+  if (requireAuth()) return;
+
+  AppConfig updated = appConfig;
+  updated.wifiSsid = "";
+  updated.wifiPassword = "";
+  const bool ok = saveConfig(updated);
+  if (ok) appConfig = updated;
 
   JsonDocument out;
   out["ok"] = ok;
-  out["message"] = ok ? "Wi-Fi zapomenuta, restartuji do captive AP" : "Nepodarilo se zapomenout Wi-Fi";
-  String payload;
-  serializeJson(out, payload);
-  webServer.send(ok ? 200 : 500, "application/json", payload);
+  out["message"] = ok ? "Wi-Fi zapomenuta, restartuji do captive AP"
+                      : "Nepodarilo se zapomenout Wi-Fi";
+  sendJson(ok ? 200 : 500, out);
 
   if (ok) {
     delay(300);
@@ -784,12 +924,14 @@ void handleApiWifiForget() {
 }
 
 void handleApiTmepSend() {
-  bool ok = sendTmepRequest(true);
-  if (ok) {
+  if (requireAuth()) return;
+
+  if (sendTmepRequest(true)) {
     webServer.send(200, "text/plain", "TMEP request byl uspesne odeslan");
     return;
   }
-  webServer.send(500, "text/plain", "TMEP request se nepodarilo odeslat (zkontrolujte URL, WiFi a data)");
+  webServer.send(500, "text/plain",
+                 "TMEP request se nepodarilo odeslat (zkontrolujte domenu, WiFi a data senzoru)");
 }
 
 void handleCaptiveRedirect() {
@@ -811,7 +953,9 @@ void setupWebServer() {
   webServer.on("/api/tmep/send", HTTP_POST, handleApiTmepSend);
 
   webServer.on("/generate_204", HTTP_ANY, handleCaptiveRedirect);
+  webServer.on("/gen_204", HTTP_ANY, handleCaptiveRedirect);
   webServer.on("/hotspot-detect.html", HTTP_ANY, handleCaptiveRedirect);
+  webServer.on("/library/test/success.html", HTTP_ANY, handleCaptiveRedirect);
   webServer.on("/connecttest.txt", HTTP_ANY, handleCaptiveRedirect);
   webServer.on("/ncsi.txt", HTTP_ANY, handleCaptiveRedirect);
   webServer.on("/redirect", HTTP_ANY, handleCaptiveRedirect);
@@ -829,103 +973,185 @@ void setupWebServer() {
 }
 
 // =============================================
+//  MQTT - HOME ASSISTANT AUTO-DISCOVERY
+// =============================================
+
+void publishHADiscovery() {
+  if (!mqtt.connected()) return;
+
+  struct HASensor {
+    const char* name;
+    const char* uidSuffix;
+    const String* topic;
+    const char* unit;
+    const char* devClass;
+    const char* icon;
+    uint8_t precision;
+  };
+
+  const HASensor sensors[] = {
+    {"Teplota",   "temp",     &topicTemp,     "°C",    "temperature",    "mdi:thermometer",   1},
+    {"Vlhkost",   "humidity", &topicHumidity, "%",     "humidity",       "mdi:water-percent", 1},
+    {"PM1.0",     "pm1",      &topicPm1,      "µg/m³", "pm1",            "mdi:blur",          1},
+    {"PM2.5",     "pm25",     &topicPm25,     "µg/m³", "pm25",           "mdi:blur",          1},
+    {"PM4.0",     "pm4",      &topicPm4,      "µg/m³", nullptr,          "mdi:blur-radial",   1},
+    {"PM10",      "pm10",     &topicPm10,     "µg/m³", "pm10",           "mdi:blur-radial",   1},
+    {"VOC Index", "voc",      &topicVoc,      nullptr, "aqi",            "mdi:air-filter",    0},
+    {"NOx Index", "nox",      &topicNox,      nullptr, "aqi",            "mdi:molecule",      0},
+    {"CO2",       "co2",      &topicCo2,      "ppm",   "carbon_dioxide", "mdi:molecule-co2",  0},
+  };
+
+  // unique_id vcetne MAC - jinak by se dve zarizeni v jedne HA prepsala.
+  const String devUid = "sharp_sen66_" + deviceId;
+
+  for (const auto& s : sensors) {
+    JsonDocument doc;
+    const String uid = devUid + "_" + s.uidSuffix;
+
+    doc["name"] = s.name;
+    doc["unique_id"] = uid;
+    doc["state_topic"] = *s.topic;
+    if (s.unit) doc["unit_of_measurement"] = s.unit;
+    if (s.devClass) doc["device_class"] = s.devClass;
+    if (s.icon) doc["icon"] = s.icon;
+    doc["state_class"] = "measurement";  // nutne pro dlouhodobe statistiky v HA
+    doc["suggested_display_precision"] = s.precision;
+    doc["availability_topic"] = topicStatus;
+    doc["payload_available"] = "online";
+    doc["payload_not_available"] = "offline";
+
+    JsonObject dev = doc["device"].to<JsonObject>();
+    dev["identifiers"][0] = devUid;
+    dev["name"] = "Sharp SEN66 Displej";
+    dev["model"] = "Sharp LS027B7DH01 + SEN66";
+    dev["manufacturer"] = "DIY";
+    dev["sw_version"] = FW_VERSION;
+    if (WiFi.status() == WL_CONNECTED) {
+      dev["configuration_url"] = String("http://") + WiFi.localIP().toString();
+    }
+
+    JsonObject origin = doc["origin"].to<JsonObject>();
+    origin["name"] = "sharp-sen66-mqtt-display";
+    origin["sw"] = FW_VERSION;
+
+    const String topic = appConfig.haPrefix + "/sensor/" + uid + "/config";
+
+    String payload;
+    serializeJson(doc, payload);
+    if (!mqtt.publish(topic.c_str(), payload.c_str(), true)) {
+      Serial.printf("HA Discovery: publish selhal (%s, %u B)\n", s.name, (unsigned)payload.length());
+    }
+    delay(50);
+  }
+
+  Serial.println("HA Discovery: Hotovo!");
+}
+
+// =============================================
 //  MQTT - CALLBACK
 // =============================================
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String message = "";
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-  
+  String message;
+  message.reserve(length);
+  for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
+
+  const String t(topic);
   Serial.printf("MQTT RX [%s]: %s\n", topic, message.c_str());
-  
-  // --- TEXT: Zobraz text na displeji ---
-  if (strcmp(topic, TOPIC_TEXT) == 0) {
+
+  // --- HA nastartoval (birth message): poslat discovery znovu ---
+  if (t == topicHaStatus) {
+    if (message == "online") {
+      Serial.println("MQTT: HA birth message, posilam discovery znovu");
+      delay(random(200, 1500));  // rozprostreni zateze dle doporuceni HA
+      publishHADiscovery();
+    }
+    return;
+  }
+
+  // --- TEXT ---
+  if (t == topicText) {
     overrideText = message;
     overrideTextSize = 2;
     overrideX = 10;
     overrideY = 10;
     displayOverride = true;
-    displayOverrideUntil = millis() + 30000; // 30s pak zpět na senzory
+    displayOverrideUntil = millis() + 30000UL;
     drawCustomTextScreen();
+    return;
   }
-  
-  // --- CLEAR: Vyčisti displej / zpět na senzory ---
-  else if (strcmp(topic, TOPIC_CLEAR) == 0) {
+
+  // --- CLEAR ---
+  if (t == topicClear) {
     displayOverride = false;
-    display.clearDisplay();
+    clearCanvas();
     display.refresh();
     Serial.println("Display cleared");
+    return;
   }
-  
-  // --- COMMAND: JSON příkazy ---
-  else if (strcmp(topic, TOPIC_COMMAND) == 0) {
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, message);
-    if (err) {
-      Serial.printf("JSON parse error: %s\n", err.c_str());
-      return;
+
+  // --- COMMAND (JSON) ---
+  if (t != topicCommand) return;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, message);
+  if (err) {
+    Serial.printf("JSON parse error: %s\n", err.c_str());
+    return;
+  }
+
+  // {"text":"Hello","x":10,"y":50,"size":3,"duration":60}
+  if (doc["text"].is<const char*>()) {
+    overrideText = doc["text"].as<String>();
+    overrideX = doc["x"] | 10;
+    overrideY = doc["y"] | 10;
+    overrideTextSize = constrain((int)(doc["size"] | 2), 1, 8);
+    const long duration = constrain((long)(doc["duration"] | 30), 1L, 86400L);
+    displayOverride = true;
+    displayOverrideUntil = millis() + (unsigned long)duration * 1000UL;
+    drawCustomTextScreen();
+  }
+
+  // {"line":{"x1":0,"y1":120,"x2":399,"y2":120}}
+  if (doc["line"].is<JsonObject>()) {
+    JsonObject line = doc["line"];
+    display.drawLine(line["x1"] | 0, line["y1"] | 0,
+                     line["x2"] | (DISPLAY_WIDTH - 1), line["y2"] | 0, inkColor());
+    display.refresh();
+  }
+
+  // {"rect":{"x":10,"y":10,"w":100,"h":50,"fill":false}}
+  if (doc["rect"].is<JsonObject>()) {
+    JsonObject rect = doc["rect"];
+    const int x = rect["x"] | 0;
+    const int y = rect["y"] | 0;
+    const int w = rect["w"] | 50;
+    const int h = rect["h"] | 30;
+    const bool fill = rect["fill"] | false;
+    if (fill) {
+      display.fillRect(x, y, w, h, inkColor());
+    } else {
+      display.drawRect(x, y, w, h, inkColor());
     }
-    
-    // Příkaz: zobraz text s parametry
-    // {"text":"Hello","x":10,"y":50,"size":3,"duration":60}
-    if (doc.containsKey("text")) {
-      overrideText = doc["text"].as<String>();
-      overrideX = doc["x"] | 10;
-      overrideY = doc["y"] | 10;
-      overrideTextSize = doc["size"] | 2;
-      int duration = doc["duration"] | 30; // sekund
-      displayOverride = true;
-      displayOverrideUntil = millis() + (duration * 1000UL);
+    display.refresh();
+  }
+
+  // {"invert":true} - softwarova inverze (Sharp LCD nema HW inverzi)
+  if (doc["invert"].is<bool>()) {
+    appConfig.displayInvertRequested = doc["invert"].as<bool>();
+    Serial.printf("Display: inverze %s (docasne, neuklada se do NVS)\n",
+                  appConfig.displayInvertRequested ? "zapnuta" : "vypnuta");
+    if (displayOverride) {
       drawCustomTextScreen();
-    }
-    
-    // Příkaz: zobraz grafické prvky
-    // {"line":{"x1":0,"y1":120,"x2":399,"y2":120}}
-    if (doc.containsKey("line")) {
-      JsonObject line = doc["line"];
-      display.drawLine(
-        line["x1"] | 0, line["y1"] | 0,
-        line["x2"] | 399, line["y2"] | 0, BLACK
-      );
-      display.refresh();
-    }
-    
-    // Příkaz: obdélník
-    // {"rect":{"x":10,"y":10,"w":100,"h":50,"fill":false}}
-    if (doc.containsKey("rect")) {
-      JsonObject rect = doc["rect"];
-      int x = rect["x"] | 0;
-      int y = rect["y"] | 0;
-      int w = rect["w"] | 50;
-      int h = rect["h"] | 30;
-      bool fill = rect["fill"] | false;
-      if (fill) {
-        display.fillRect(x, y, w, h, BLACK);
-      } else {
-        display.drawRect(x, y, w, h, BLACK);
-      }
-      display.refresh();
-    }
-    
-    // Příkaz: inverze displeje
-    // {"invert":true}
-    if (doc.containsKey("invert")) {
-      // Sharp LCD nemá HW inverzi, ale můžeme přepsat barvy
-      Serial.println("Invert command received");
-    }
-    
-    // Příkaz: přepni zpět na senzorový dashboard
-    // {"dashboard":true}
-    if (doc.containsKey("dashboard")) {
-      displayOverride = false;
+    } else {
       drawSensorScreen();
     }
-    
-    // Příkaz: nastav interval publikování
-    // {"publish_interval":5000}
-    // (handled dynamically)
+  }
+
+  // {"dashboard":true}
+  if (doc["dashboard"].is<bool>()) {
+    displayOverride = false;
+    drawSensorScreen();
   }
 }
 
@@ -939,38 +1165,38 @@ void publishSensorData() {
     Serial.println("MQTT: warmup delay aktivni, publikace preskocena");
     return;
   }
-  
+
   char buf[16];
-  
-  // Jednotlivé hodnoty
+
   snprintf(buf, sizeof(buf), "%.1f", sensorData.temperature);
-  mqtt.publish(TOPIC_TEMP, buf, true);
-  
+  mqtt.publish(topicTemp.c_str(), buf, true);
+
   snprintf(buf, sizeof(buf), "%.1f", sensorData.humidity);
-  mqtt.publish(TOPIC_HUMIDITY, buf, true);
-  
+  mqtt.publish(topicHumidity.c_str(), buf, true);
+
   snprintf(buf, sizeof(buf), "%.1f", sensorData.pm1);
-  mqtt.publish(TOPIC_PM1, buf, true);
-  
+  mqtt.publish(topicPm1.c_str(), buf, true);
+
   snprintf(buf, sizeof(buf), "%.1f", sensorData.pm25);
-  mqtt.publish(TOPIC_PM25, buf, true);
-  
+  mqtt.publish(topicPm25.c_str(), buf, true);
+
   snprintf(buf, sizeof(buf), "%.1f", sensorData.pm4);
-  mqtt.publish(TOPIC_PM4, buf, true);
-  
+  mqtt.publish(topicPm4.c_str(), buf, true);
+
   snprintf(buf, sizeof(buf), "%.1f", sensorData.pm10);
-  mqtt.publish(TOPIC_PM10, buf, true);
-  
+  mqtt.publish(topicPm10.c_str(), buf, true);
+
   snprintf(buf, sizeof(buf), "%.0f", sensorData.voc);
-  mqtt.publish(TOPIC_VOC, buf, true);
-  
+  mqtt.publish(topicVoc.c_str(), buf, true);
+
   snprintf(buf, sizeof(buf), "%.0f", sensorData.nox);
-  mqtt.publish(TOPIC_NOX, buf, true);
-  
-  snprintf(buf, sizeof(buf), "%u", sensorData.co2);
-  mqtt.publish(TOPIC_CO2, buf, true);
-  
-  // Kompletní JSON
+  mqtt.publish(topicNox.c_str(), buf, true);
+
+  if (sensorData.co2Valid) {
+    snprintf(buf, sizeof(buf), "%u", sensorData.co2);
+    mqtt.publish(topicCo2.c_str(), buf, true);
+  }
+
   JsonDocument doc;
   doc["temperature"] = round(sensorData.temperature * 10) / 10.0;
   doc["humidity"]    = round(sensorData.humidity * 10) / 10.0;
@@ -980,77 +1206,16 @@ void publishSensorData() {
   doc["pm10"] = round(sensorData.pm10 * 10) / 10.0;
   doc["voc"]  = round(sensorData.voc);
   doc["nox"]  = round(sensorData.nox);
-  doc["co2"]  = sensorData.co2;
+  if (sensorData.co2Valid) doc["co2"] = sensorData.co2;
   doc["quality"] = getAirQuality(sensorData.pm25);
-  doc["uptime"]  = millis() / 1000;
-  
-  char jsonBuf[512];
-  serializeJson(doc, jsonBuf, sizeof(jsonBuf));
-  mqtt.publish(TOPIC_SENSOR, jsonBuf, true);
-  
-  Serial.println("MQTT: Sensor data published");
-  Serial.printf("MQTT: payload JSON: %s\n", jsonBuf);
-}
+  doc["rssi"] = WiFi.RSSI();
+  doc["uptime"] = millis() / 1000;
 
-// =============================================
-//  MQTT - HOME ASSISTANT AUTO-DISCOVERY
-// =============================================
+  String jsonBuf;
+  serializeJson(doc, jsonBuf);
+  mqtt.publish(topicSensor.c_str(), jsonBuf.c_str(), true);
 
-void publishHADiscovery() {
-  // Struktura pro jednotlivé senzory
-  struct HASensor {
-    const char* name;
-    const char* uid;
-    const char* topic;
-    const char* unit;
-    const char* devClass;
-    const char* icon;
-  };
-  
-  HASensor sensors[] = {
-    {"Teplota",     "sen66_temp",     TOPIC_TEMP,     "°C",     "temperature",  "mdi:thermometer"},
-    {"Vlhkost",     "sen66_humidity", TOPIC_HUMIDITY,  "%",      "humidity",     "mdi:water-percent"},
-    {"PM1.0",       "sen66_pm1",      TOPIC_PM1,       "µg/m³", "pm1",          "mdi:blur"},
-    {"PM2.5",       "sen66_pm25",     TOPIC_PM25,      "µg/m³", "pm25",         "mdi:blur"},
-    {"PM4.0",       "sen66_pm4",      TOPIC_PM4,       "µg/m³", NULL,           "mdi:blur-radial"},
-    {"PM10",        "sen66_pm10",     TOPIC_PM10,      "µg/m³", "pm10",         "mdi:blur-radial"},
-    {"VOC Index",   "sen66_voc",      TOPIC_VOC,       "",       NULL,           "mdi:air-filter"},
-    {"NOx Index",   "sen66_nox",      TOPIC_NOX,       "",       NULL,           "mdi:molecule"},
-    {"CO2",         "sen66_co2",      TOPIC_CO2,       "ppm",   "carbon_dioxide","mdi:molecule-co2"},
-  };
-  
-  for (auto& s : sensors) {
-    JsonDocument doc;
-    doc["name"] = s.name;
-    doc["unique_id"] = s.uid;
-    doc["state_topic"] = s.topic;
-    doc["unit_of_measurement"] = s.unit;
-    if (s.devClass) doc["device_class"] = s.devClass;
-    if (s.icon) doc["icon"] = s.icon;
-    doc["availability_topic"] = TOPIC_STATUS;
-    doc["payload_available"] = "online";
-    doc["payload_not_available"] = "offline";
-    
-    // Device info
-    JsonObject dev = doc["device"].to<JsonObject>();
-    dev["identifiers"][0] = "sharp_sen66_esp32c3";
-    dev["name"] = "Sharp SEN66 Displej";
-    dev["model"] = "ESP32-C3 + SEN66 + Sharp LCD";
-    dev["manufacturer"] = "DIY";
-    dev["sw_version"] = "2.0.0";
-    
-    char topic[128];
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/config", s.uid);
-    
-    char payload[512];
-    serializeJson(doc, payload, sizeof(payload));
-    mqtt.publish(topic, payload, true);
-    
-    Serial.printf("HA Discovery: %s\n", s.name);
-    delay(50); // malý delay mezi zprávami
-  }
-  
-  Serial.println("HA Discovery: Hotovo!");
+  Serial.printf("MQTT: publikovano, JSON: %s\n", jsonBuf.c_str());
 }
 
 // =============================================
@@ -1058,30 +1223,33 @@ void publishHADiscovery() {
 // =============================================
 
 bool reconnectMQTT() {
+  if (appConfig.mqttServer.length() == 0) return false;
+
   Serial.print("MQTT: Pripojuji...");
-  
-  // Last will - offline status
-  if (mqtt.connect(appConfig.mqttClientId.c_str(), appConfig.mqttUser.c_str(), appConfig.mqttPassword.c_str(),
-                    TOPIC_STATUS, 0, true, "offline")) {
-    Serial.println("OK!");
-    
-    // Status online
-    mqtt.publish(TOPIC_STATUS, "online", true);
-    
-    // Subscribe
-    mqtt.subscribe(TOPIC_TEXT);
-    mqtt.subscribe(TOPIC_CLEAR);
-    mqtt.subscribe(TOPIC_COMMAND);
-    mqtt.subscribe(TOPIC_BRIGHTNESS);
-    
-    // HA Auto-Discovery
-    publishHADiscovery();
-    
-    return true;
-  } else {
+
+  // Client ID musi byt na brokeru unikatni - pridavame MAC suffix.
+  const String clientId = appConfig.mqttClientId + "-" + deviceId;
+
+  const char* user = appConfig.mqttUser.length() ? appConfig.mqttUser.c_str() : nullptr;
+  const char* pass = appConfig.mqttPassword.length() ? appConfig.mqttPassword.c_str() : nullptr;
+
+  if (!mqtt.connect(clientId.c_str(), user, pass,
+                    topicStatus.c_str(), 0, true, "offline")) {
     Serial.printf("CHYBA rc=%d\n", mqtt.state());
     return false;
   }
+
+  Serial.println("OK!");
+
+  mqtt.publish(topicStatus.c_str(), "online", true);
+
+  mqtt.subscribe(topicText.c_str());
+  mqtt.subscribe(topicClear.c_str());
+  mqtt.subscribe(topicCommand.c_str());
+  mqtt.subscribe(topicHaStatus.c_str());
+
+  publishHADiscovery();
+  return true;
 }
 
 // =============================================
@@ -1090,47 +1258,64 @@ bool reconnectMQTT() {
 
 void setup() {
   Serial.begin(115200);
-  delay(2000); // ESP32-C3 potřebuje čas na USB Serial
-  
+  delay(2000);  // ESP32-C3 potrebuje cas na USB Serial
+
   Serial.println("\n========================================");
-  Serial.println("  Sharp LCD + SEN66 + MQTT v2.0.0");
+  Serial.println("  Sharp LCD + SEN66 + MQTT v" FW_VERSION);
   Serial.println("========================================\n");
-  
-  bool configLoaded = loadConfig(appConfig);
+
+  const bool configLoaded = loadConfig(appConfig);
   Serial.printf("CFG: load %s\n", configLoaded ? "OK" : "FAILED - defaults");
-  Serial.printf("CFG: MQTT %s:%d, MQTT interval=%lu ms, TMEP interval=%lu ms\n", appConfig.mqttServer.c_str(), appConfig.mqttPort, appConfig.mqttPublishInterval, appConfig.tmepRequestInterval);
-  Serial.printf("CFG: TMEP domena: %s\n", appConfig.tmepDomain.length() ? appConfig.tmepDomain.c_str() : "(nenastaveno)");
-  Serial.printf("CFG: temperature offset=%.2f\n", appConfig.temperatureOffset);
+
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char idBuf[7];
+  snprintf(idBuf, sizeof(idBuf), "%02x%02x%02x", mac[3], mac[4], mac[5]);
+  deviceId = String(idBuf);
+
+  buildTopics();
+
+  Serial.printf("CFG: device id=%s, base topic=%s, HA prefix=%s\n",
+                deviceId.c_str(), appConfig.mqttBaseTopic.c_str(), appConfig.haPrefix.c_str());
+  Serial.printf("CFG: MQTT %s:%d, publish=%lu ms, TMEP=%lu ms, warmup=%lu ms\n",
+                appConfig.mqttServer.length() ? appConfig.mqttServer.c_str() : "(nenastaveno)",
+                appConfig.mqttPort, appConfig.mqttPublishInterval,
+                appConfig.tmepRequestInterval, appConfig.mqttWarmupDelay);
+  Serial.printf("CFG: TMEP domena: %s\n",
+                appConfig.tmepDomain.length() ? appConfig.tmepDomain.c_str() : "(nenastaveno)");
+  Serial.printf("CFG: temperature offset=%.2f, web auth=%s\n",
+                appConfig.temperatureOffset,
+                appConfig.webPassword.length() ? "zapnuta" : "vypnuta");
 
   // 1. Displej
   Serial.println("Display: Inicializace...");
   display.begin();
   applyDisplaySettings();
-  display.clearDisplay();
-  display.setTextColor(BLACK);
+  clearCanvas();
   drawSplashScreen();
   Serial.println("Display: OK!");
-  
-  // 2. WiFi provisioning (STA/AP captive)
+
+  // 2. WiFi provisioning (STA / AP captive)
   wifiProvisioning.begin(&appConfig, 20000UL);
-  
+
   // 3. MQTT
   mqtt.setServer(appConfig.mqttServer.c_str(), appConfig.mqttPort);
   mqtt.setCallback(mqttCallback);
-  mqtt.setBufferSize(1024); // Větší buffer pro HA Discovery JSON
-  
+  mqtt.setBufferSize(2048);  // HA discovery payload s device+origin ma pres 500 B
+  mqtt.setKeepAlive(30);
+
   if (wifiProvisioning.getState() == WIFI_STA_CONNECTED) {
     reconnectMQTT();
   }
 
   setupWebServer();
-  
+
   // 4. SEN66
   initSEN66();
-  
+
   // 5. Splash na 2 sekundy
   delay(2000);
-  
+
   Serial.println("\n=== SETUP HOTOV ===\n");
 }
 
@@ -1139,12 +1324,11 @@ void setup() {
 // =============================================
 
 void loop() {
-  unsigned long now = millis();
+  const unsigned long now = millis();
 
   wifiProvisioning.process();
   webServer.handleClient();
 
-  // --- MQTT reconnect ---
   if (wifiProvisioning.getState() == WIFI_STA_CONNECTED && !mqtt.connected()) {
     if (now - lastMqttReconnect > MQTT_RECONNECT_INTERVAL) {
       lastMqttReconnect = now;
@@ -1152,36 +1336,31 @@ void loop() {
     }
   }
 
-  // --- MQTT loop ---
   if (mqtt.connected()) {
     mqtt.loop();
   }
 
-  // --- Čtení SEN66 ---
   if (now - lastSensorRead > SENSOR_READ_INTERVAL) {
     lastSensorRead = now;
     readSEN66();
   }
 
-  // --- Publikování do MQTT ---
   if (now - lastMqttPublish > appConfig.mqttPublishInterval) {
     lastMqttPublish = now;
     publishSensorData();
   }
 
-  // --- Odeslani dat na TMEP ---
   if (now - lastTmepRequest > appConfig.tmepRequestInterval) {
     lastTmepRequest = now;
     sendTmepRequest(false);
   }
 
-  // --- Override timeout (vrátit se na senzorový dashboard) ---
-  if (displayOverride && now > displayOverrideUntil) {
+  // Pozor: znamenkovy rozdil, aby to prezilo preteceni millis() po ~49,7 dne.
+  if (displayOverride && (long)(now - displayOverrideUntil) >= 0) {
     displayOverride = false;
     Serial.println("Display: Override expired, zpet na dashboard");
   }
 
-  // --- Refresh displeje ---
   if (now - lastDisplayRefresh > appConfig.displayRefreshInterval) {
     lastDisplayRefresh = now;
     if (!displayOverride) {
@@ -1191,4 +1370,3 @@ void loop() {
 
   delay(10);
 }
-

@@ -6,6 +6,14 @@
 namespace {
 constexpr const char* NS = "appcfg";
 
+String sanitizeTopic(String topic, const char* fallback) {
+  topic.trim();
+  while (topic.endsWith("/")) topic.remove(topic.length() - 1);
+  while (topic.startsWith("/")) topic.remove(0, 1);
+  if (topic.length() == 0) topic = fallback;
+  return topic;
+}
+
 void sanitize(AppConfig& cfg) {
   if (cfg.mqttPort < 1 || cfg.mqttPort > 65535) cfg.mqttPort = 1883;
   if (cfg.displayRotation > 3) cfg.displayRotation = 2;
@@ -14,23 +22,34 @@ void sanitize(AppConfig& cfg) {
   if (cfg.tmepRequestInterval < 1000) cfg.tmepRequestInterval = 60000;
   if (cfg.mqttWarmupDelay < 1000) cfg.mqttWarmupDelay = 60000;
   if (!isfinite(cfg.temperatureOffset)) cfg.temperatureOffset = -2.0f;
+  if (cfg.temperatureOffset < -20.0f) cfg.temperatureOffset = -20.0f;
+  if (cfg.temperatureOffset > 20.0f) cfg.temperatureOffset = 20.0f;
+  if (cfg.mqttClientId.length() == 0) cfg.mqttClientId = "sharp-sen66";
+  if (cfg.webUser.length() == 0) cfg.webUser = "admin";
+  cfg.mqttBaseTopic = sanitizeTopic(cfg.mqttBaseTopic, "sharp");
+  cfg.haPrefix = sanitizeTopic(cfg.haPrefix, "homeassistant");
 }
 }  // namespace
 
 bool validateConfig(const AppConfig& cfg) {
-  if (cfg.mqttServer.length() == 0) return false;
   if (cfg.mqttPort < 1 || cfg.mqttPort > 65535) return false;
   if (cfg.displayRotation > 3) return false;
   if (cfg.displayRefreshInterval < 500) return false;
   if (cfg.mqttPublishInterval < 1000) return false;
   if (cfg.tmepRequestInterval < 1000) return false;
   if (cfg.mqttWarmupDelay < 1000) return false;
+  if (!isfinite(cfg.temperatureOffset)) return false;
+  if (cfg.temperatureOffset < -20.0f || cfg.temperatureOffset > 20.0f) return false;
+  // mqttServer smi byt prazdny: zarizeni pak jede jen s displejem + TMEP
   return true;
 }
 
 bool loadConfig(AppConfig& config) {
   Preferences pref;
-  if (!pref.begin(NS, true)) return false;
+  if (!pref.begin(NS, true)) {
+    sanitize(config);
+    return false;
+  }
 
   config.wifiSsid = pref.getString("wifi_ssid", config.wifiSsid);
   config.wifiPassword = pref.getString("wifi_pass", config.wifiPassword);
@@ -40,6 +59,11 @@ bool loadConfig(AppConfig& config) {
   config.mqttUser = pref.getString("mqtt_user", config.mqttUser);
   config.mqttPassword = pref.getString("mqtt_pass", config.mqttPassword);
   config.mqttClientId = pref.getString("mqtt_client", config.mqttClientId);
+  config.mqttBaseTopic = pref.getString("mqtt_base", config.mqttBaseTopic);
+  config.haPrefix = pref.getString("ha_prefix", config.haPrefix);
+
+  config.webUser = pref.getString("web_user", config.webUser);
+  config.webPassword = pref.getString("web_pass", config.webPassword);
 
   config.tmepDomain = pref.getString("tmep_domain", config.tmepDomain);
   config.tmepParams = pref.getString("tmep_params", config.tmepParams);
@@ -49,9 +73,7 @@ bool loadConfig(AppConfig& config) {
   config.displayRefreshInterval = pref.getULong("disp_ref_ms", config.displayRefreshInterval);
   config.mqttWarmupDelay = pref.getULong("mqtt_warmup", config.mqttWarmupDelay);
 
-  config.tmepBaseUrl = pref.getString("tmep_base", config.tmepBaseUrl);
   config.temperatureOffset = pref.getFloat("temp_offset", config.temperatureOffset);
-
   config.displayRotation = pref.getUChar("disp_rot", config.displayRotation);
   config.displayInvertRequested = pref.getBool("disp_inv", config.displayInvertRequested);
 
@@ -60,34 +82,39 @@ bool loadConfig(AppConfig& config) {
   return true;
 }
 
-bool saveConfig(const AppConfig& config) {
+bool saveConfig(AppConfig& config) {
+  sanitize(config);
   if (!validateConfig(config)) return false;
+  const AppConfig& cfg = config;
 
   Preferences pref;
   if (!pref.begin(NS, false)) return false;
 
-  pref.putString("wifi_ssid", config.wifiSsid);
-  pref.putString("wifi_pass", config.wifiPassword);
+  pref.putString("wifi_ssid", cfg.wifiSsid);
+  pref.putString("wifi_pass", cfg.wifiPassword);
 
-  pref.putString("mqtt_server", config.mqttServer);
-  pref.putInt("mqtt_port", config.mqttPort);
-  pref.putString("mqtt_user", config.mqttUser);
-  pref.putString("mqtt_pass", config.mqttPassword);
-  pref.putString("mqtt_client", config.mqttClientId);
+  pref.putString("mqtt_server", cfg.mqttServer);
+  pref.putInt("mqtt_port", cfg.mqttPort);
+  pref.putString("mqtt_user", cfg.mqttUser);
+  pref.putString("mqtt_pass", cfg.mqttPassword);
+  pref.putString("mqtt_client", cfg.mqttClientId);
+  pref.putString("mqtt_base", cfg.mqttBaseTopic);
+  pref.putString("ha_prefix", cfg.haPrefix);
 
-  pref.putString("tmep_domain", config.tmepDomain);
-  pref.putString("tmep_params", config.tmepParams);
+  pref.putString("web_user", cfg.webUser);
+  pref.putString("web_pass", cfg.webPassword);
 
-  pref.putULong("mqtt_pub_ms", config.mqttPublishInterval);
-  pref.putULong("tmep_req_ms", config.tmepRequestInterval);
-  pref.putULong("disp_ref_ms", config.displayRefreshInterval);
-  pref.putULong("mqtt_warmup", config.mqttWarmupDelay);
+  pref.putString("tmep_domain", cfg.tmepDomain);
+  pref.putString("tmep_params", cfg.tmepParams);
 
-  pref.putString("tmep_base", config.tmepBaseUrl);
-  pref.putFloat("temp_offset", config.temperatureOffset);
+  pref.putULong("mqtt_pub_ms", cfg.mqttPublishInterval);
+  pref.putULong("tmep_req_ms", cfg.tmepRequestInterval);
+  pref.putULong("disp_ref_ms", cfg.displayRefreshInterval);
+  pref.putULong("mqtt_warmup", cfg.mqttWarmupDelay);
 
-  pref.putUChar("disp_rot", config.displayRotation);
-  pref.putBool("disp_inv", config.displayInvertRequested);
+  pref.putFloat("temp_offset", cfg.temperatureOffset);
+  pref.putUChar("disp_rot", cfg.displayRotation);
+  pref.putBool("disp_inv", cfg.displayInvertRequested);
 
   pref.end();
   return true;
