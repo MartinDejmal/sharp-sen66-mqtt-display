@@ -51,6 +51,12 @@ A printable enclosure is available on Printables:
 - All settings are stored in NVS
 - Optional upload to **TMEP.cz** via HTTP GET with templated parameters
 
+### Live web dashboard
+
+- Responsive cards with Czech labels, localized numbers and units (°C, %, µg/m³, ppm). VOC and NOₓ are dimensionless indices.
+- Color and text indicators for CO₂, PM2.5, PM10, VOC and NOₓ, with thresholds explained in an expandable legend. These are indicative bands for instantaneous readings, not health limits or an AQI calculation. PM1 and PM4 are shown without a rating.
+- Refreshes every two seconds with connection states and readable uptime. Invalid readings, gas sensor warmup and connection failures show a dash with an explanation.
+
 > The on-device texts (display, web UI, Home Assistant entity names) are in Czech.
 
 ## Hardware

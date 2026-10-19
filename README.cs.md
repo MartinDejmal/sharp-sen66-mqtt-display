@@ -51,6 +51,12 @@ Krabička pro 3D tisk je ke stažení na Printables:
 - Veškeré nastavení se ukládá do NVS
 - Volitelné odesílání na **TMEP.cz** přes HTTP GET se šablonovanými parametry
 
+### Webový přehled aktuálních dat
+
+- Responzivní karty s českými popisky, desetinnou čárkou a jednotkami °C, %, µg/m³ a ppm. VOC a NOₓ jsou bezrozměrné indexy, nikoli koncentrace.
+- CO₂, PM2,5, PM10, VOC a NOₓ mají barevné i slovní hodnocení. Rozbalovací legenda uvádí přesné hranice a vysvětlení; jde o orientační stupnici okamžitých hodnot, nikoli zdravotní limity či výpočet AQI. PM1 a PM4 zůstávají bez barevného hodnocení.
+- Obnova každé 2 sekundy, samostatné stavy připojení a doba běhu. Při neplatných datech, náběhu plynového senzoru nebo výpadku webového spojení se místo dotčených hodnot zobrazí pomlčka a vysvětlení.
+
 ## Hardware
 
 | Součástka | Zapojení |
