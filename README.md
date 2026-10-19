@@ -4,7 +4,7 @@ Stanice pro měření kvality vnitřního vzduchu s displejem **Sharp Memory LCD
 
 Postaveno na **ESP32-C3-MINI1**, PlatformIO + framework Arduino.
 
-Aktuální firmware: **2.2.0** - viz [CHANGELOG.md](CHANGELOG.md).
+Aktuální firmware: **2.2.1** - viz [CHANGELOG.md](CHANGELOG.md).
 
 ![Sestava se SEN66](SEN66-asm2%20v11.png)
 
@@ -45,6 +45,7 @@ Krabička pro 3D tisk je ke stažení na Printables:
 
 - Zprovoznění Wi-Fi přes **AP a captive portál** (ve zdrojácích nejsou žádné přihlašovací údaje)
 - Vestavěné webové rozhraní na portu 80, volitelně chráněné heslem
+- **Aktualizace firmware přes web (OTA)** - stačí nahrát `firmware.bin` z GitHub release
 - Veškeré nastavení se ukládá do NVS
 - Volitelné odesílání na **TMEP.cz** přes HTTP GET se šablonovanými parametry
 
@@ -81,8 +82,8 @@ GPIO8            I2C SCL         SEN66
 1. **Naklonujte repozitář**
 
    ```bash
-   git clone https://github.com/MartinDejmal/sharp-sen66-mqtt-display.git
-   cd sharp-sen66-mqtt-display
+   git clone https://github.com/VladaWaas/VladaWaas-sharp-sen66-mqtt-display2.git
+   cd VladaWaas-sharp-sen66-mqtt-display2
    ```
 
 2. **Otevřete projekt ve VS Code** - `File → Open Folder` a vyberte naklonovanou složku.
@@ -90,6 +91,8 @@ GPIO8            I2C SCL         SEN66
 3. **Přeložte a nahrajte** - `Ctrl+Shift+P` → `PlatformIO: Upload`, případně šipkou **→** v modrém stavovém řádku.
 
 4. **Sledujte sériový výstup** - `Ctrl+Shift+P` → `PlatformIO: Serial Monitor` (115200 baud).
+
+Bez překládání lze použít hotové soubory z [GitHub Releases](https://github.com/VladaWaas/VladaWaas-sharp-sen66-mqtt-display2/releases) - viz [Aktualizace firmware](#aktualizace-firmware).
 
 Ve zdrojových souborech není potřeba nic upravovat. Výchozí hodnoty jsou v `src/config.h` a všechno se nastavuje za běhu přes captive portál a webové rozhraní.
 
@@ -106,6 +109,12 @@ Ve zdrojových souborech není potřeba nic upravovat. Výchozí hodnoty jsou v 
 
 Stavy Wi-Fi: `WIFI_STA_CONNECTING` → `WIFI_STA_CONNECTED`, se záložním `WIFI_AP_CAPTIVE`.
 
+### Výpadek Wi-Fi
+
+Pokud se zařízení s uloženým SSID nepřipojí (např. při restartu routeru), přepne do záložního přístupového bodu, ale **každé 2 minuty zkouší původní síť znovu** a po jejím návratu se k ní samo připojí. Přístupový bod mezitím běží dál. Pokud je k němu právě někdo připojený, pokus se odloží, aby se mu nerozbilo rozdělané nastavení.
+
+V záložním režimu je webové rozhraní **chráněné heslem** stejně jako v běžném provozu. Bez hesla je jen prvotní nastavení, tj. dokud zařízení nemá uložené žádné SSID.
+
 ## Webové rozhraní
 
 Jakmile je zařízení ve vaší síti, otevřete `http://<ip-zarizeni>/`.
@@ -118,9 +127,9 @@ Jakmile je zařízení ve vaší síti, otevřete `http://<ip-zarizeni>/`.
 
 | Skupina | Položky |
 |---------|---------|
-| Wi-Fi | SSID, heslo, uložení jen Wi-Fi, zapomenutí Wi-Fi |
+| Wi-Fi | SSID, heslo (lze smazat pro otevřenou síť), uložení jen Wi-Fi, zapomenutí Wi-Fi |
 | MQTT | server, port, uživatel, heslo, client ID, **base topic**, **discovery prefix Home Assistantu** |
-| Zabezpečení web UI | uživatel a heslo pro HTTP Basic Auth (prázdné heslo = bez přihlašování) |
+| Zabezpečení web UI | uživatel a heslo pro HTTP Basic Auth (smazané heslo = bez přihlašování) |
 | TMEP.cz | doména, parametry požadavku, náhled skutečné URL, ruční odeslání |
 | Displej | rotace (0-3, výchozí **2**), inverze (0/1) |
 | Intervaly | překreslení displeje, MQTT publish, TMEP request, MQTT warmup delay |
@@ -129,11 +138,41 @@ Jakmile je zařízení ve vaší síti, otevřete `http://<ip-zarizeni>/`.
 Konfigurace se zapisuje do NVS a přežije restart. Uložení zařízení restartuje.
 
 > **Hesla API nikdy neposílá zpět.** `GET /api/config` vrací pouze příznaky
-> `wifiPasswordSet` / `mqttPasswordSet` / `webPasswordSet`. Ponechání pole s heslem
-> prázdného znamená, že se uložená hodnota nemění.
+> `wifiPasswordSet` / `mqttPasswordSet` / `webPasswordSet` (formulář podle nich ukáže
+> „nastaveno“ / „nenastaveno“). Ponechání pole s heslem prázdného znamená, že se uložená
+> hodnota nemění. Heslo se odstraní zaškrtnutím **Smazat heslo** u příslušného pole
+> (v API odesláním prázdného řetězce).
+
+### Záložka Aktualizace
+
+Nahrání nového firmware přes síť - viz [Aktualizace firmware](#aktualizace-firmware).
 
 > Rozvržení dashboardu počítá s rotacemi na šířku (0 a 2). Rotace 1 a 3 panel sice
 > otočí, ale layout pro 240×400 připravený není.
+
+## Aktualizace firmware
+
+Každé vydání na [GitHub Releases](https://github.com/VladaWaas/VladaWaas-sharp-sen66-mqtt-display2/releases) obsahuje dva hotové soubory, které sestavuje GitHub Actions:
+
+| Soubor | K čemu | Konfigurace |
+|--------|--------|-------------|
+| `firmware.bin` | Aktualizace přes web (OTA) | zůstane zachována |
+| `factory.bin` | Čistá instalace kabelem od adresy `0x0` | **smaže se** (Wi-Fi, MQTT, hesla) |
+
+### Přes web (OTA) - od verze 2.2.1
+
+1. Stáhněte `firmware.bin` z požadovaného vydání.
+2. Ve webovém rozhraní otevřete záložku **Aktualizace**, vyberte soubor a dejte **Nahrát a restartovat**.
+3. Zařízení firmware ověří, restartuje se a za zhruba 20 sekund naběhne s novou verzí.
+
+OTA funguje jen tehdy, když je zařízení připojené k Wi-Fi (v záložním přístupovém bodu je vypnutá) a je chráněné stejným heslem jako webové rozhraní. Poškozený nebo nesprávný soubor zařízení odmítne a běží dál na původní verzi.
+
+### Kabelem
+
+Starší verze než 2.2.1 OTA neumí, takže na ni je potřeba jednou přejít kabelem:
+
+- **se zachováním konfigurace**: z naklonovaného repozitáře `PlatformIO: Upload` (viz [Instalace](#instalace)),
+- **načisto**: `factory.bin` od adresy `0x0`, např. přes webový [ESP Tool](https://espressif.github.io/esptool-js/) v Chrome/Edge. Hodí se i při zapomenutém hesle k webovému rozhraní.
 
 ## Nastavení Home Assistantu
 
@@ -251,7 +290,7 @@ Všechny topicy níže vycházejí z nastavitelného base topicu, ve výchozím 
 | `sharp/sensor/nox` | `12` | NOx Index |
 | `sharp/sensor/co2` | `832` | CO2 ppm (dokud není platné, neodesílá se) |
 | `sharp/sensor` | `{...}` | Všechny hodnoty jako JSON |
-| `sharp/status` | `online` | Dostupnost (retained, LWT) |
+| `sharp/status` | `online` | Dostupnost (retained, LWT). `offline` i tehdy, když ze senzoru 30 s nepřišla platná data |
 
 Všechny zprávy se senzorickými daty se publikují jako retained.
 
@@ -359,6 +398,9 @@ entities:
 | První minutu se nic nepublikuje | Tak to má být, jde o `mqttWarmupDelay` |
 | CO2 ukazuje `---` | Zhruba první minutu po startu normální; pokud to trvá, hodnota je mimo platné rozmezí 300-10000 ppm |
 | Dvě zařízení si přepisují data | Nastavte každému jiný **base topic** ve webovém rozhraní |
+| Po přechodu z 2.0.0 má HA entity dvakrát | Od 2.2.1 firmware staré discovery (`homeassistant/sensor/sen66_*`) při připojení sám smaže; nové entity mají v ID MAC adresu |
+| Entity jsou „nedostupné“, i když zařízení běží | Senzor 30 s nedodal platná data; firmware ho po opakovaných chybách sám zkusí znovu inicializovat - zkontrolujte kabel k SEN66 |
+| Zapomenuté heslo k webu | Nahrajte kabelem `factory.bin` (smaže konfiguraci) a zařízení nastavte znovu |
 
 ## Závislosti
 
@@ -372,7 +414,7 @@ Stáhne je automaticky PlatformIO, verze jsou připnuté v `platformio.ini`:
 - [PubSubClient](https://github.com/knolleary/pubsubclient) (MQTT)
 - [ArduinoJson](https://github.com/bblanchon/ArduinoJson) 7.x
 
-Knihovny `WiFi`, `WebServer`, `DNSServer`, `HTTPClient`, `Preferences` a `Wire` jsou součástí ESP32 Arduino core.
+Knihovny `WiFi`, `WebServer`, `DNSServer`, `HTTPClient`, `Preferences`, `Update` a `Wire` jsou součástí ESP32 Arduino core.
 
 ## Struktura projektu
 
@@ -383,6 +425,7 @@ src/
   WifiProvisioning.*    připojení jako klient, záložní AP, captive DNS
 platformio.ini          konfigurace buildu s připnutými verzemi
 CHANGELOG.md            přehled změn
+.github/workflows/      build při každém pushi, při tagu v* vydání s binárkami
 ```
 
 ## Licence

@@ -2,6 +2,48 @@
 
 Formát vychází z [Keep a Changelog](https://keepachangelog.com/cs/1.1.0/).
 
+## [2.2.1] - 2026-10-19
+
+Verze 2.2.0 nebyla samostatně vydána, toto vydání obsahuje i všechny její změny - viz
+sekce [2.2.0] v [CHANGELOG.md](https://github.com/VladaWaas/VladaWaas-sharp-sen66-mqtt-display2/blob/main/CHANGELOG.md).
+Mimo jiné: zabezpečení webu heslem, MAC v `unique_id` (více zařízení v jednom HA),
+`state_class` pro dlouhodobé statistiky, konfigurovatelný base topic a oprava ukládání
+číselných hodnot z webového formuláře.
+
+### Přidáno
+
+- **Aktualizace firmware přes web (OTA)** - nová záložka **Aktualizace** ve webovém
+  rozhraní, nahrává se `firmware.bin` z GitHub release. Chráněno heslem webového
+  rozhraní, v záložním AP režimu vypnuto, `factory.bin` je odmítnut. Průběh i výsledek
+  se ukazuje na displeji.
+- **Vydání s binárkami** - workflow při tagu `v*` sestaví firmware, ověří, že se vejde
+  do OTA oddílu, a k GitHub release přiloží `firmware.bin` (OTA) a `factory.bin`
+  (čistá instalace kabelem od `0x0`).
+- **Mazání hesel ve webovém rozhraní** - u hesla k Wi-Fi, MQTT i webu je volba
+  *Smazat heslo*. Formulář navíc ukazuje, zda je heslo nastavené.
+
+### Opraveno
+
+- **Po výpadku Wi-Fi delším než 20 s zůstalo zařízení natrvalo v AP režimu**
+  (typicky po restartu routeru), a to s otevřenou sítí a webem bez hesla. Nyní každé
+  2 minuty zkouší původní síť (AP mezitím běží dál) a samo se vrátí. Záložní AP režim
+  je navíc chráněný heslem webu; bez hesla zůstává jen prvotní nastavení.
+- **Heslo nešlo ve webovém rozhraní smazat** - prázdné pole znamenalo „beze změny“,
+  takže jednou nastavené heslo k webu nebo MQTT nešlo odstranit.
+- **Duplicitní entity v Home Assistantu po přechodu z 2.0.0** - staré retained discovery
+  zprávy (`homeassistant/sensor/sen66_*/config`) se při připojení k MQTT smažou.
+- **Zamrzlá data** - když SEN66 přestal odpovídat, posílaly se do MQTT a TMEP stále
+  poslední hodnoty. Po 30 s bez platného vzorku jsou data neplatná, displej ukáže
+  „Čekám na data“ a `sharp/status` přejde na `offline`, takže HA entity označí jako
+  nedostupné. Po obnovení dat se znovu čeká warmup.
+- **SEN66 se po neúspěšné inicializaci už nikdy nezkusil znovu** - nyní každých 30 s,
+  a také po 10 chybách čtení za sebou.
+- **Záporná nebo nečíselná hodnota v `/api/config`** se u intervalů přetočila na obří
+  číslo a prošla validací (např. `-1` → publikace nikdy). Nyní je požadavek odmítnut.
+- **TMEP ignoroval warmup delay** a posílal hodnoty z náběhu senzoru. Ruční odeslání
+  z webu funguje i během warmupu.
+- Clone URL v README ukazovala na fork místo tohoto repozitáře.
+
 ## [2.2.0] - 2026-08-11
 
 ### Opraveno

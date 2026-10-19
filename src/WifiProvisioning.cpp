@@ -6,6 +6,10 @@ namespace {
 constexpr byte DNS_PORT = 53;
 constexpr const char* AP_PASSWORD = "";  // open AP for easier onboarding
 
+// Jak casto z AP fallbacku zkouset puvodni Wi-Fi. Restart routeru trva typicky
+// 1-3 minuty - drive zarizeni v AP rezimu zustalo natrvalo az do restartu.
+constexpr unsigned long STA_PROBE_INTERVAL_MS = 120000UL;
+
 String buildApName() {
   uint8_t mac[6];
   WiFi.macAddress(mac);
@@ -34,6 +38,7 @@ void WifiProvisioning::begin(AppConfig* config, unsigned long connectTimeoutMs) 
 void WifiProvisioning::process() {
   if (state_ == WIFI_AP_CAPTIVE && captiveRunning_) {
     dnsServer_.processNextRequest();
+    processCaptiveStaRetry();
     return;
   }
 
@@ -169,6 +174,10 @@ void WifiProvisioning::startCaptiveMode() {
   dnsServer_.start(DNS_PORT, "*", apIp_);
   captiveRunning_ = true;
 
+  captiveStartedAt_ = millis();
+  lastStaProbeAt_ = captiveStartedAt_;
+  staProbeActive_ = false;
+
   Serial.printf("WIFI PROV: AP %s (%s), open=%s, dns=%s\n",
                 apSsid_.c_str(), apIp_.toString().c_str(),
                 AP_PASSWORD[0] == '\0' ? "ano" : "ne",
@@ -184,6 +193,51 @@ void WifiProvisioning::stopCaptiveMode() {
   if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
     WiFi.softAPdisconnect(true);
   }
+}
+
+// V AP fallbacku (SSID je ulozene) se pravidelne zkousi puvodni sit. AP pri tom
+// bezi dal (rezim AP+STA), takze portal zustava dostupny. Pokud je k AP nekdo
+// pripojeny, pokus se odklada, aby se mu nerozbilo prave probihajici nastaveni.
+void WifiProvisioning::processCaptiveStaRetry() {
+  if (!hasStoredCredentials()) return;
+
+  const unsigned long now = millis();
+
+  if (staProbeActive_) {
+    if (WiFi.status() == WL_CONNECTED) {
+      staProbeActive_ = false;
+      stopCaptiveMode();
+      WiFi.mode(WIFI_STA);
+      state_ = WIFI_STA_CONNECTED;
+      staConnectStartedAt_ = 0;
+      lastReconnectAttemptAt_ = 0;
+      Serial.printf("WIFI PROV: Navrat z AP fallbacku po %lu s, IP: %s\n",
+                    (now - captiveStartedAt_) / 1000UL,
+                    WiFi.localIP().toString().c_str());
+      return;
+    }
+    if (now - staProbeStartedAt_ >= connectTimeoutMs_) {
+      staProbeActive_ = false;
+      lastStaProbeAt_ = now;
+      WiFi.disconnect(false, false);  // zastavit STA, AP nechat bezet
+      Serial.println("WIFI PROV: Puvodni Wi-Fi stale nedostupna, zustavam v AP");
+    }
+    return;
+  }
+
+  if (now - lastStaProbeAt_ < STA_PROBE_INTERVAL_MS) return;
+
+  if (WiFi.softAPgetStationNum() > 0) {
+    lastStaProbeAt_ = now;  // nekdo je v portalu - zkusime pozdeji
+    return;
+  }
+
+  staProbeActive_ = true;
+  staProbeStartedAt_ = now;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(config_->wifiSsid.c_str(), config_->wifiPassword.c_str());
+  Serial.printf("WIFI PROV: Zkousim puvodni SSID '%s' (AP bezi dal)\n",
+                config_->wifiSsid.c_str());
 }
 
 bool WifiProvisioning::hasStoredCredentials() const {

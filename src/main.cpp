@@ -3,8 +3,8 @@
  *  Sharp Memory LCD + SEN66 Sensor + MQTT (Home Assistant)
  *  ESP32-C3-MINI1 | PlatformIO + Arduino Framework
  * ============================================================
- *  Verze: 2.2.0
- *  Datum: 2026-08-11
+ *  Verze: 2.2.1
+ *  Datum: 2026-10-19
  *
  *  Piny:
  *    SPI (displej): CLK=6, MOSI=7, MISO=2, CS=3
@@ -22,10 +22,13 @@
 #include <Adafruit_SharpMem.h>
 #include <SensirionI2cSen66.h>
 #include <ArduinoJson.h>
+#include <Update.h>
+#include <cmath>
+#include <limits>
 #include "config.h"
 #include "WifiProvisioning.h"
 
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.2.1"
 
 // =============================================
 //  HARDWARE
@@ -50,6 +53,9 @@
 // Intervaly (ms)
 #define SENSOR_READ_INTERVAL     2000
 #define MQTT_RECONNECT_INTERVAL  5000
+#define SENSOR_STALE_TIMEOUT     30000  // bez platneho vzorku dele => data neplatna
+#define SEN66_REINIT_INTERVAL    30000  // jak casto zkouset znovu inicializovat SEN66
+#define SEN66_MAX_READ_ERRORS    10     // po tolika chybach cteni za sebou => reinit
 
 // =============================================
 //  GLOBALNI OBJEKTY
@@ -127,6 +133,13 @@ unsigned long lastDisplayRefresh = 0;
 unsigned long lastMqttReconnect = 0;
 unsigned long lastTmepRequest = 0;
 unsigned long firstValidSensorAt = 0;
+unsigned long lastValidSensorAt = 0;
+unsigned long lastSen66InitAttempt = 0;
+uint8_t sen66ReadErrors = 0;
+bool sensorStale = false;          // data zamrzla => HA availability "offline"
+bool legacyDiscoveryCleaned = false;
+
+void publishAvailability();  // definovano v sekci MQTT
 
 String lastTmepStatus = "TMEP:---";
 
@@ -451,8 +464,8 @@ void drawSplashScreen() {
 #define NO_ERROR 0
 
 void initSEN66() {
-  Serial.println("SEN66: Inicializace I2C...");
-  Wire.begin(PIN_SDA, PIN_SCL);
+  Serial.println("SEN66: Inicializace...");
+  sen66ReadErrors = 0;
 
   sen66.begin(Wire, SEN66_I2C_ADDR_6B);
 
@@ -503,8 +516,13 @@ void readSEN66() {
     char msg[64];
     errorToString(error, msg, sizeof(msg));
     Serial.printf("SEN66: readMeasuredValues() CHYBA: %s\n", msg);
+    if (++sen66ReadErrors >= SEN66_MAX_READ_ERRORS) {
+      Serial.println("SEN66: opakovane chyby cteni, zkusim senzor znovu inicializovat");
+      sen66Ready = false;
+    }
     return;
   }
+  sen66ReadErrors = 0;
 
   if (!coreValuesLookValid(pm1, pm25, pm4, pm10, hum, temp, voc, nox)) {
     Serial.println("SEN66: neplatna data (T/H/PM/VOC/NOx), vzorek preskocen");
@@ -528,11 +546,25 @@ void readSEN66() {
     sensorData.co2Valid = false;
   }
 
-  if (firstValidSensorAt == 0) firstValidSensorAt = millis();
+  lastValidSensorAt = millis();
+  if (firstValidSensorAt == 0) firstValidSensorAt = lastValidSensorAt;
+
+  if (sensorStale) {
+    sensorStale = false;
+    Serial.println("SEN66: data opet aktualni");
+    publishAvailability();
+  }
 
   Serial.printf("SEN66: T(raw)=%.1f T(adj)=%.1f H=%.1f PM2.5=%.1f VOC=%.0f NOx=%.0f CO2=%s\n",
                 temp, sensorData.temperature, hum, pm25, voc, nox,
                 sensorData.co2Valid ? String(sensorData.co2).c_str() : "n/a");
+}
+
+// Prvni hodnoty po startu/resetu senzoru byvaji nesmyslne - do MQTT ani TMEP
+// se posilaji az po uplynuti mqttWarmupDelay od prvniho platneho vzorku.
+bool sensorWarmupDone() {
+  return firstValidSensorAt != 0 &&
+         (millis() - firstValidSensorAt) >= appConfig.mqttWarmupDelay;
 }
 
 // =============================================
@@ -596,6 +628,11 @@ bool sendTmepRequest(const bool manualTrigger) {
     lastTmepStatus = "TMEP:SKIP";
     return false;
   }
+  if (!manualTrigger && !sensorWarmupDone()) {
+    Serial.println("TMEP: warmup delay aktivni, request preskocen");
+    lastTmepStatus = "TMEP:WAIT";
+    return false;
+  }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("TMEP: WiFi neni pripojena, request preskocen");
     lastTmepStatus = "TMEP:SKIP";
@@ -637,10 +674,11 @@ bool sendTmepRequest(const bool manualTrigger) {
 //  WEB SERVER
 // =============================================
 
-// V captive rezimu autentizaci nevyzadujeme, jinak by se uzivatel nedostal
-// k prvotnimu nastaveni. V STA rezimu chrani heslo, pokud je nastavene.
+// Bez hesla jen pri prvotnim nastaveni (AP rezim a zadne ulozene SSID), jinak
+// by se uzivatel k zarizeni vubec nedostal. AP fallback po vypadku Wi-Fi je
+// heslem chraneny - driv nebyl a otevrena sit tak zpristupnila celou konfiguraci.
 bool requireAuth() {
-  if (wifiProvisioning.isCaptiveMode()) return false;
+  if (wifiProvisioning.isCaptiveMode() && !wifiProvisioning.hasStoredCredentials()) return false;
   if (appConfig.webPassword.length() == 0) return false;
   if (!webServer.authenticate(appConfig.webUser.c_str(), appConfig.webPassword.c_str())) {
     webServer.requestAuthentication();
@@ -668,46 +706,66 @@ body{font-family:Arial,sans-serif;margin:0;background:#f3f5f7;color:#222}header{
 label{display:block;font-size:14px;margin-top:8px}input{width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;box-sizing:border-box}
 button.save,button.secondary,button.warn{margin-top:12px;padding:10px 14px;color:#fff;border:0;border-radius:8px;cursor:pointer}
 button.save{background:#16a34a}button.secondary{background:#2563eb}button.warn{background:#b91c1c}
+label.chk{display:flex;align-items:center;gap:6px}label.chk input{width:auto}progress{width:100%;height:18px;margin-top:10px}
 .muted{color:#666;font-size:13px}.ok{color:#166534}.err{color:#b91c1c}code.url{display:block;padding:8px;background:#f1f5f9;border-radius:6px;word-break:break-all;font-size:13px}
 </style></head><body><header><h2>SEN66 MQTT displej</h2></header><main>
-<div class="tabs"><button class="tab active" data-tab="data">Aktuální data</button><button class="tab" data-tab="cfg">Konfigurace</button></div>
+<div class="tabs"><button class="tab active" data-tab="data">Aktuální data</button><button class="tab" data-tab="cfg">Konfigurace</button><button class="tab" data-tab="fw">Aktualizace</button></div>
 <section id="data" class="panel active"><div class="grid" id="cards"></div><p class="muted" id="status"></p></section>
 <section id="cfg" class="panel"><form id="cfgForm"><h3>Wi-Fi</h3>
 <p class="muted" id="wifiMode"></p><p class="muted" id="wifiConn"></p>
 <label>SSID<input name="wifiSsid" required></label>
 <label>Heslo<input type="password" name="wifiPassword" id="wifiPass" placeholder="(beze změny)"></label>
-<label><input id="showPass" type="checkbox" style="width:auto"> Zobrazit heslo</label>
+<label class="chk"><input id="showPass" type="checkbox"> Zobrazit heslo</label>
+<label class="chk"><input id="clrWifi" type="checkbox" data-for="wifiPassword"> Smazat heslo (otevřená síť)</label>
 <button id="wifiOnlySaveBtn" class="secondary" type="button">Uložit jen Wi-Fi a restartovat</button>
 <button id="wifiForgetBtn" class="warn" type="button">Zapomenout Wi-Fi</button><p class="muted" id="wifiMsg"></p>
-<h3>MQTT</h3><label>Server<input name="mqttServer" placeholder="192.168.1.10"></label><label>Port<input type="number" min="1" max="65535" name="mqttPort" required></label><label>Uživatel<input name="mqttUser"></label><label>Heslo<input type="password" name="mqttPassword" placeholder="(beze změny)"></label>
+<h3>MQTT</h3><label>Server<input name="mqttServer" placeholder="192.168.1.10"></label><label>Port<input type="number" min="1" max="65535" name="mqttPort" required></label><label>Uživatel<input name="mqttUser"></label><label>Heslo<input type="password" name="mqttPassword" placeholder="(beze změny)"></label><label class="chk"><input id="clrMqtt" type="checkbox" data-for="mqttPassword"> Smazat heslo</label>
 <label>Client ID<input name="mqttClientId"></label><label>Base topic<input name="mqttBaseTopic" placeholder="sharp"></label><label>Discovery prefix Home Assistantu<input name="haPrefix" placeholder="homeassistant"></label>
-<h3>Zabezpečení web UI</h3><label>Uživatel<input name="webUser" placeholder="admin"></label><label>Heslo (prázdné pole = beze změny)<input type="password" name="webPassword" placeholder="(beze změny)"></label>
+<h3>Zabezpečení web UI</h3><label>Uživatel<input name="webUser" placeholder="admin"></label><label>Heslo (prázdné pole = beze změny)<input type="password" name="webPassword" placeholder="(beze změny)"></label><label class="chk"><input id="clrWeb" type="checkbox" data-for="webPassword"> Smazat heslo (web UI bude bez přihlášení)</label>
 <h3>TMEP.cz</h3><label>Doména pro zasílání hodnot<input name="tmepDomain" placeholder="xxk4sk-g6rxfh"></label><label>Parametry požadavku<input name="tmepParams" placeholder="tempV=*TEMP*&humV=*HUM*&co2=*CO2*"></label>
 <p class="muted">Proměnné: *TEMP*, *HUM*, *PM1*, *PM2*, *PM4*, *PM10*, *VOC*, *NOX*, *CO2*, *RSSI*, *UPTIME*, *FREEHEAP*, *IP*.</p><p class="muted">Reálné URL volané na TMEP.cz:</p><code id="tmepUrl" class="url muted">Není dostupné</code>
 <button id="tmepSendBtn" class="secondary" type="button">Odeslat TMEP request ručně</button><p id="tmepMsg" class="muted"></p>
 <h3>Displej</h3><label>Rotace (0-3)<input type="number" min="0" max="3" name="displayRotation" required></label><label>Inverze (0/1)<input type="number" min="0" max="1" name="displayInvertRequested" required></label>
 <h3>Intervaly (ms)</h3><label>Překreslení displeje<input type="number" min="500" name="displayRefreshInterval" required></label><label>MQTT publish<input type="number" min="1000" name="mqttPublishInterval" required></label><label>TMEP request interval<input type="number" min="1000" name="tmepRequestInterval" required></label><label>MQTT warmup delay<input type="number" min="1000" name="mqttWarmupDelay" required></label>
 <h3>Kalibrace</h3><label>Teplotní offset (°C)<input type="number" step="0.1" min="-20" max="20" name="temperatureOffset" required></label><p class="muted">Hodnota se přičítá k naměřené teplotě.</p>
-<button class="save" type="submit">Uložit plnou konfiguraci</button><p id="cfgMsg" class="muted"></p></form></section></main>
+<button class="save" type="submit">Uložit plnou konfiguraci</button><p id="cfgMsg" class="muted"></p></form></section>
+<section id="fw" class="panel"><h3>Aktualizace firmware (OTA)</h3><p>Aktuální verze: <strong id="fwVer">?</strong></p>
+<p class="muted">Nahrajte soubor <code>firmware.bin</code> z GitHub release. Soubor <code>factory.bin</code> je jen pro nahrání kabelem. Konfigurace zůstane zachována.</p>
+<input type="file" id="otaFile" accept=".bin"><button id="otaBtn" class="secondary" type="button">Nahrát a restartovat</button>
+<progress id="otaProg" max="100" value="0"></progress><p id="otaMsg" class="muted"></p></section></main>
 <script>
+const PWD=[['wifiPassword','clrWifi'],['mqttPassword','clrMqtt'],['webPassword','clrWeb']];
 const NUM=['mqttPort','displayRotation','displayInvertRequested','displayRefreshInterval','mqttPublishInterval','tmepRequestInterval','mqttWarmupDelay','temperatureOffset'];
 const tabs=document.querySelectorAll('.tab');tabs.forEach(t=>t.onclick=()=>{tabs.forEach(x=>x.classList.remove('active'));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));t.classList.add('active');document.getElementById(t.dataset.tab).classList.add('active')});
 function setMsg(id,text,ok){const m=document.getElementById(id);m.textContent=text;m.className=ok?'ok':'err'}
-async function loadData(){try{const r=await fetch('/api/data');const d=await r.json();const cards=document.getElementById('cards');cards.innerHTML='';for(const [k,v] of Object.entries(d.values)){const c=document.createElement('div');c.className='card';const t=document.createElement('strong');t.textContent=k;const val=document.createElement('div');val.textContent=v;c.appendChild(t);c.appendChild(val);cards.appendChild(c)}
+let otaBusy=false;
+async function loadData(){if(otaBusy)return;try{const r=await fetch('/api/data');const d=await r.json();const cards=document.getElementById('cards');cards.innerHTML='';for(const [k,v] of Object.entries(d.values)){const c=document.createElement('div');c.className='card';const t=document.createElement('strong');t.textContent=k;const val=document.createElement('div');val.textContent=v;c.appendChild(t);c.appendChild(val);cards.appendChild(c)}
+document.getElementById('fwVer').textContent=d.fw;
 document.getElementById('status').textContent='WiFi: '+d.wifi+' | režim: '+d.wifiMode+' | TMEP: '+d.tmepStatus+' | MQTT: '+d.mqtt+' | validní data: '+d.valid+' | uptime: '+d.uptime+' s | FW '+d.fw;
 document.getElementById('wifiMode').textContent='Režim: '+d.wifiMode+(d.apSsid?(' | AP: '+d.apSsid+' @ '+d.apIp):'');
 document.getElementById('wifiConn').textContent='Aktuální SSID: '+(d.currentSsid||'-')+' | IP: '+(d.currentIp||'-')+' | RSSI: '+(d.rssi||'-')+' dBm';
 const u=document.getElementById('tmepUrl');u.textContent=d.tmepUrl||'Není dostupné';u.className=d.tmepUrl?'url':'url muted'}catch(e){}}
-async function loadCfg(){const r=await fetch('/api/config');const c=await r.json();const f=document.getElementById('cfgForm');Object.keys(c).forEach(k=>{const el=f[k];if(el&&'value' in el)el.value=c[k]})}
+async function loadCfg(){const r=await fetch('/api/config');const c=await r.json();const f=document.getElementById('cfgForm');Object.keys(c).forEach(k=>{const el=f[k];if(el&&'value' in el)el.value=c[k]});
+PWD.forEach(([k])=>{f[k].placeholder=c[k+'Set']?'(nastaveno – beze změny)':'(nenastaveno)'})}
+document.querySelectorAll('input[data-for]').forEach(cb=>cb.onchange=()=>{const el=document.getElementById('cfgForm')[cb.dataset.for];el.disabled=cb.checked;if(cb.checked)el.value=''});
 function buildPayload(f){const p=Object.fromEntries(new FormData(f).entries());
 NUM.forEach(k=>{if(p[k]!==undefined&&p[k]!=='')p[k]=Number(p[k]);else delete p[k]});
-['wifiPassword','mqttPassword','webPassword'].forEach(k=>{if(p[k]==='')delete p[k]});
+// Heslo: prazdne pole = beze zmeny, zaskrtnute "Smazat" = poslat prazdny retezec (smaze se).
+PWD.forEach(([k,c])=>{if(document.getElementById(c).checked)p[k]='';else if(p[k]===''||p[k]===undefined)delete p[k]});
 return p}
 document.getElementById('showPass').onchange=(e)=>{document.getElementById('wifiPass').type=e.target.checked?'text':'password'};
 document.getElementById('cfgForm').onsubmit=async(e)=>{e.preventDefault();const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(buildPayload(e.target))});setMsg('cfgMsg',await r.text(),r.ok)};
-document.getElementById('wifiOnlySaveBtn').onclick=async()=>{const f=document.getElementById('cfgForm');const p={wifiSsid:f.wifiSsid.value};if(f.wifiPassword.value!=='')p.wifiPassword=f.wifiPassword.value;const r=await fetch('/api/wifi/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});const d=await r.json();setMsg('wifiMsg',d.message||'?',r.ok)};
+document.getElementById('wifiOnlySaveBtn').onclick=async()=>{const f=document.getElementById('cfgForm');const p={wifiSsid:f.wifiSsid.value};if(document.getElementById('clrWifi').checked)p.wifiPassword='';else if(f.wifiPassword.value!=='')p.wifiPassword=f.wifiPassword.value;const r=await fetch('/api/wifi/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});const d=await r.json();setMsg('wifiMsg',d.message||'?',r.ok)};
 document.getElementById('wifiForgetBtn').onclick=async()=>{if(!confirm('Opravdu smazat uložené Wi-Fi údaje a restartovat do AP režimu?'))return;const r=await fetch('/api/wifi/forget',{method:'POST'});const d=await r.json();setMsg('wifiMsg',d.message||'?',r.ok)};
 document.getElementById('tmepSendBtn').onclick=async()=>{const r=await fetch('/api/tmep/send',{method:'POST'});setMsg('tmepMsg',await r.text(),r.ok);await loadData()};
+document.getElementById('otaBtn').onclick=()=>{const file=document.getElementById('otaFile').files[0];
+if(!file){setMsg('otaMsg','Vyberte soubor firmware.bin',false);return}
+if(/factory/i.test(file.name)){setMsg('otaMsg','factory.bin je určen pro nahrání kabelem, pro OTA použijte firmware.bin',false);return}
+const fd=new FormData();fd.append('firmware',file,file.name);const x=new XMLHttpRequest();const prog=document.getElementById('otaProg');
+x.open('POST','/update');x.upload.onprogress=e=>{if(e.lengthComputable)prog.value=Math.round(e.loaded/e.total*100)};
+x.onload=()=>{otaBusy=false;setMsg('otaMsg',x.responseText,x.status===200);if(x.status===200){setMsg('otaMsg',x.responseText+' Stránka se za 20 s obnoví.',true);setTimeout(()=>location.reload(),20000)}};
+x.onerror=()=>{otaBusy=false;setMsg('otaMsg','Přenos selhal',false)};
+otaBusy=true;prog.value=0;setMsg('otaMsg','Nahrávám '+file.name+'…',true);x.send(fd)};
 loadData();loadCfg();setInterval(loadData,2000);
 </script></body></html>)HTML";
 
@@ -780,20 +838,40 @@ void handleApiConfigGet() {
   sendJson(200, doc);
 }
 
-// HTML formular posila vsechny hodnoty jako retezce. ArduinoJson 7 vraci
-// u `variant | default` default, pokud typ nesedi - proto explicitni prevod.
+// HTML formular posila hodnoty i jako retezce. ArduinoJson 7 vraci u
+// `variant | default` default, pokud typ nesedi - proto explicitni prevod.
+// Chybejici klic nebo prazdny retezec = beze zmeny (vraci true, `out` nemeni).
+// Vraci false pro nesmysl ("abc"), desetinne cislo u celociselne polozky nebo
+// hodnotu mimo rozsah typu - drive se napr. -1 u intervalu pretocilo na
+// 4294967295 a validaci proslo.
 template <typename T>
-T readNumber(JsonVariantConst v, T fallback) {
-  if (v.isNull()) return fallback;
-  if (v.is<T>()) return v.as<T>();
+bool readNumber(JsonVariantConst v, T& out) {
+  if (v.isNull()) return true;
+
+  double d;
   if (v.is<const char*>()) {
     String s = v.as<String>();
     s.trim();
-    if (s.length() == 0) return fallback;
-    return (T)s.toDouble();
+    if (s.length() == 0) return true;
+    char* end = nullptr;
+    d = strtod(s.c_str(), &end);
+    if (end == s.c_str() || *end != '\0') return false;
+  } else if (v.is<long>()) {
+    d = (double)v.as<long>();
+  } else if (v.is<double>()) {
+    d = v.as<double>();
+  } else {
+    return false;
   }
-  if (v.is<float>()) return (T)v.as<float>();
-  return fallback;
+
+  if (!std::isfinite(d)) return false;
+  if (std::numeric_limits<T>::is_integer) {
+    if (d != std::floor(d)) return false;
+    if (d < (double)std::numeric_limits<T>::min() ||
+        d > (double)std::numeric_limits<T>::max()) return false;
+  }
+  out = (T)d;
+  return true;
 }
 
 String readString(JsonVariantConst v, const String& fallback) {
@@ -828,20 +906,25 @@ void handleApiConfigPost() {
   if (!doc["mqttPassword"].isNull()) updated.mqttPassword = doc["mqttPassword"].as<String>();
   if (!doc["webPassword"].isNull()) updated.webPassword = doc["webPassword"].as<String>();
 
-  updated.mqttPort        = readNumber<int>(doc["mqttPort"], updated.mqttPort);
-  updated.displayRotation = (uint8_t)readNumber<int>(doc["displayRotation"], updated.displayRotation);
-  updated.displayInvertRequested =
-      readNumber<int>(doc["displayInvertRequested"], updated.displayInvertRequested ? 1 : 0) != 0;
-  updated.displayRefreshInterval =
-      readNumber<unsigned long>(doc["displayRefreshInterval"], updated.displayRefreshInterval);
-  updated.mqttPublishInterval =
-      readNumber<unsigned long>(doc["mqttPublishInterval"], updated.mqttPublishInterval);
-  updated.tmepRequestInterval =
-      readNumber<unsigned long>(doc["tmepRequestInterval"], updated.tmepRequestInterval);
-  updated.mqttWarmupDelay =
-      readNumber<unsigned long>(doc["mqttWarmupDelay"], updated.mqttWarmupDelay);
-  updated.temperatureOffset =
-      readNumber<float>(doc["temperatureOffset"], updated.temperatureOffset);
+  int rotation = updated.displayRotation;
+  int invert = updated.displayInvertRequested ? 1 : 0;
+
+  bool numbersOk = true;
+  numbersOk &= readNumber(doc["mqttPort"], updated.mqttPort);
+  numbersOk &= readNumber(doc["displayRotation"], rotation);
+  numbersOk &= readNumber(doc["displayInvertRequested"], invert);
+  numbersOk &= readNumber(doc["displayRefreshInterval"], updated.displayRefreshInterval);
+  numbersOk &= readNumber(doc["mqttPublishInterval"], updated.mqttPublishInterval);
+  numbersOk &= readNumber(doc["tmepRequestInterval"], updated.tmepRequestInterval);
+  numbersOk &= readNumber(doc["mqttWarmupDelay"], updated.mqttWarmupDelay);
+  numbersOk &= readNumber(doc["temperatureOffset"], updated.temperatureOffset);
+
+  if (!numbersOk || rotation < 0 || rotation > 3 || (invert != 0 && invert != 1)) {
+    webServer.send(400, "text/plain", "Neplatne ciselne hodnoty konfigurace");
+    return;
+  }
+  updated.displayRotation = (uint8_t)rotation;
+  updated.displayInvertRequested = invert == 1;
 
   if (!validateConfig(updated)) {
     webServer.send(400, "text/plain", "Neplatne hodnoty konfigurace");
@@ -934,6 +1017,109 @@ void handleApiTmepSend() {
                  "TMEP request se nepodarilo odeslat (zkontrolujte domenu, WiFi a data senzoru)");
 }
 
+// =============================================
+//  OTA AKTUALIZACE PRES WEB UI
+// =============================================
+
+// OTA jen v rezimu pripojeni k Wi-Fi. V AP rezimu je sit otevrena a pri
+// prvotnim nastaveni i bez hesla - nahrani firmware by tam mohl kdokoli.
+bool otaAllowedNow() {
+  return wifiProvisioning.getState() == WIFI_STA_CONNECTED;
+}
+
+String otaError;
+bool otaInProgress = false;
+
+void drawOtaScreen(const char* msg) {
+  displayOverride = true;
+  displayOverrideUntil = millis() + 300000UL;  // dashboard neprekresli hlasku
+  clearCanvas();
+  drawCenteredText("Aktualizace FW", 70, 3);
+  drawCenteredText(msg, 120, 2);
+  display.refresh();
+}
+
+// Volano pro kazdy blok nahravaneho souboru. Hlavicky (vcetne autentizace) uz
+// jsou v tu chvili zpracovane, takze heslo se overuje hned na zacatku a bez
+// nej se do flash nic nezapise.
+void handleOtaUpload() {
+  HTTPUpload& up = webServer.upload();
+
+  switch (up.status) {
+    case UPLOAD_FILE_START:
+      otaError = "";
+      otaInProgress = false;
+      if (!otaAllowedNow()) {
+        otaError = "OTA je dostupne jen pri pripojeni k Wi-Fi";
+        return;
+      }
+      if (appConfig.webPassword.length() &&
+          !webServer.authenticate(appConfig.webUser.c_str(), appConfig.webPassword.c_str())) {
+        otaError = "Neautorizovano";
+        return;
+      }
+      if (up.filename.indexOf("factory") >= 0) {
+        otaError = "factory.bin je urcen pro nahrani kabelem, pro OTA pouzijte firmware.bin";
+        return;
+      }
+      Serial.printf("OTA: start, soubor %s\n", up.filename.c_str());
+      drawOtaScreen("Nahravam firmware...");
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+        otaError = String("Nelze zahajit aktualizaci: ") + Update.errorString();
+        return;
+      }
+      otaInProgress = true;
+      break;
+
+    case UPLOAD_FILE_WRITE:
+      if (!otaInProgress) return;
+      if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+        otaError = String("Zapis selhal: ") + Update.errorString();
+        Update.abort();
+        otaInProgress = false;
+      }
+      break;
+
+    case UPLOAD_FILE_END:
+      if (!otaInProgress) return;
+      otaInProgress = false;
+      if (!Update.end(true)) {
+        otaError = String("Overeni firmware selhalo: ") + Update.errorString();
+      } else {
+        Serial.printf("OTA: prijato %u B, firmware overen\n", (unsigned)up.totalSize);
+      }
+      break;
+
+    case UPLOAD_FILE_ABORTED:
+    default:
+      if (otaInProgress) Update.abort();
+      otaInProgress = false;
+      otaError = "Prenos byl prerusen";
+      break;
+  }
+}
+
+void handleOtaDone() {
+  if (!otaAllowedNow()) {
+    webServer.send(403, "text/plain", "OTA je dostupne jen pri pripojeni k Wi-Fi");
+    return;
+  }
+  if (requireAuth()) return;
+
+  if (otaError.length() || !Update.isFinished()) {
+    const String msg = otaError.length() ? otaError : String("Firmware nebyl prijat");
+    Serial.printf("OTA: CHYBA - %s\n", msg.c_str());
+    displayOverride = false;  // zpet na dashboard
+    webServer.send(500, "text/plain", msg);
+    return;
+  }
+
+  webServer.send(200, "text/plain", "Firmware nahran a overen, restartuji...");
+  drawOtaScreen("Hotovo, restart...");
+  delay(500);
+  ESP.restart();
+}
+
 void handleCaptiveRedirect() {
   if (!wifiProvisioning.isCaptiveMode()) {
     webServer.send(404, "text/plain", "Not found");
@@ -951,6 +1137,7 @@ void setupWebServer() {
   webServer.on("/api/wifi/save", HTTP_POST, handleApiWifiSave);
   webServer.on("/api/wifi/forget", HTTP_POST, handleApiWifiForget);
   webServer.on("/api/tmep/send", HTTP_POST, handleApiTmepSend);
+  webServer.on("/update", HTTP_POST, handleOtaDone, handleOtaUpload);
 
   webServer.on("/generate_204", HTTP_ANY, handleCaptiveRedirect);
   webServer.on("/gen_204", HTTP_ANY, handleCaptiveRedirect);
@@ -1161,7 +1348,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 void publishSensorData() {
   if (!mqtt.connected() || !sensorData.valid) return;
-  if (firstValidSensorAt == 0 || (millis() - firstValidSensorAt) < appConfig.mqttWarmupDelay) {
+  if (!sensorWarmupDone()) {
     Serial.println("MQTT: warmup delay aktivni, publikace preskocena");
     return;
   }
@@ -1219,6 +1406,33 @@ void publishSensorData() {
 }
 
 // =============================================
+//  MQTT - AVAILABILITY A UKLID
+// =============================================
+
+// "online" jen kdyz data ze senzoru nejsou zamrzla - jinak by HA dal ukazoval
+// posledni hodnotu, jako by byla aktualni.
+void publishAvailability() {
+  if (!mqtt.connected()) return;
+  mqtt.publish(topicStatus.c_str(), sensorStale ? "offline" : "online", true);
+}
+
+// FW <= 2.0.0 publikoval discovery pod unique_id "sen66_*" (bez MAC) do pevneho
+// prefixu "homeassistant". Ty retained zpravy na brokeru zustaly a mirily na
+// stejne state topicy jako nove, takze HA mel kazdou entitu dvakrat. Prazdna
+// retained zprava je v HA smaze.
+void cleanupLegacyDiscovery() {
+  static const char* const legacyIds[] = {
+    "sen66_temp", "sen66_humidity", "sen66_pm1", "sen66_pm25", "sen66_pm4",
+    "sen66_pm10", "sen66_voc", "sen66_nox", "sen66_co2",
+  };
+  for (const char* id : legacyIds) {
+    const String topic = String("homeassistant/sensor/") + id + "/config";
+    mqtt.publish(topic.c_str(), "", true);
+  }
+  Serial.println("HA Discovery: stare entity z FW 2.0.0 odstraneny");
+}
+
+// =============================================
 //  MQTT - CONNECT
 // =============================================
 
@@ -1241,13 +1455,17 @@ bool reconnectMQTT() {
 
   Serial.println("OK!");
 
-  mqtt.publish(topicStatus.c_str(), "online", true);
+  publishAvailability();
 
   mqtt.subscribe(topicText.c_str());
   mqtt.subscribe(topicClear.c_str());
   mqtt.subscribe(topicCommand.c_str());
   mqtt.subscribe(topicHaStatus.c_str());
 
+  if (!legacyDiscoveryCleaned) {
+    cleanupLegacyDiscovery();
+    legacyDiscoveryCleaned = true;
+  }
   publishHADiscovery();
   return true;
 }
@@ -1311,7 +1529,9 @@ void setup() {
   setupWebServer();
 
   // 4. SEN66
+  Wire.begin(PIN_SDA, PIN_SCL);
   initSEN66();
+  lastSen66InitAttempt = millis();
 
   // 5. Splash na 2 sekundy
   delay(2000);
@@ -1340,9 +1560,27 @@ void loop() {
     mqtt.loop();
   }
 
+  // Senzor, ktery neprosel inicializaci nebo opakovane selhava, zkousime znovu.
+  if (!sen66Ready && now - lastSen66InitAttempt >= SEN66_REINIT_INTERVAL) {
+    lastSen66InitAttempt = now;
+    initSEN66();
+  }
+
   if (now - lastSensorRead > SENSOR_READ_INTERVAL) {
     lastSensorRead = now;
     readSEN66();
+  }
+
+  // Zamrzla data: dlouho zadny platny vzorek => neplatne. Displej ukaze
+  // "Cekam na data", MQTT/TMEP prestanou posilat stare hodnoty a HA dostane
+  // availability "offline". Po obnoveni dat se znovu ceka warmup.
+  if (sensorData.valid && millis() - lastValidSensorAt > SENSOR_STALE_TIMEOUT) {
+    sensorData.valid = false;
+    sensorData.co2Valid = false;
+    firstValidSensorAt = 0;
+    sensorStale = true;
+    Serial.println("SEN66: zadna platna data, hodnoty oznaceny jako neplatne");
+    publishAvailability();
   }
 
   if (now - lastMqttPublish > appConfig.mqttPublishInterval) {
