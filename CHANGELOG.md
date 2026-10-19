@@ -19,6 +19,7 @@ Mimo jiné: zabezpečení webu heslem, MAC v `unique_id` (více zařízení v je
 - **Vydání s binárkami** - workflow při tagu `v*` sestaví firmware, ověří, že se vejde
   do OTA oddílu, a k GitHub release přiloží `firmware.bin` (OTA) a `factory.bin`
   (čistá instalace kabelem od `0x0`).
+- **Anglické README** - `README.md` je nově anglicky, česká verze je v `README.cs.md`.
 - **Mazání hesel ve webovém rozhraní** - u hesla k Wi-Fi, MQTT i webu je volba
   *Smazat heslo*. Formulář navíc ukazuje, zda je heslo nastavené.
 
