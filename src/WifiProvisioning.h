@@ -26,11 +26,15 @@ class WifiProvisioning {
   String getApSsid() const { return apSsid_; }
   String getApIp() const { return apIp_.toString(); }
 
+  // true = zarizeni ma ulozene SSID, AP rezim je jen nouzovy fallback
+  // (napr. po vypadku routeru), nikoli prvotni nastaveni.
+  bool hasStoredCredentials() const;
+
  private:
   bool connectStaBlocking(unsigned long timeoutMs);
   void startCaptiveMode();
   void stopCaptiveMode();
-  bool hasStoredCredentials() const;
+  void processCaptiveStaRetry();
 
   AppConfig* config_ = nullptr;
   DNSServer dnsServer_;
@@ -43,4 +47,10 @@ class WifiProvisioning {
 
   unsigned long staConnectStartedAt_ = 0;
   unsigned long lastReconnectAttemptAt_ = 0;
+
+  // Opakovane pokusy o navrat do STA z AP fallbacku (AP mezitim bezi dal).
+  unsigned long captiveStartedAt_ = 0;
+  unsigned long lastStaProbeAt_ = 0;
+  unsigned long staProbeStartedAt_ = 0;
+  bool staProbeActive_ = false;
 };

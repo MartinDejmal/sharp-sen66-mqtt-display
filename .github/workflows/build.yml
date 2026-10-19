@@ -1,0 +1,119 @@
+name: PlatformIO Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # vytvoreni release pri tagu
+
+env:
+  BUILD_DIR: .pio/build/esp32-c3-devkitm-1
+  # Velikost OTA oddilu (app0/app1) ve vychozi tabulce default.csv pro 4 MB flash
+  OTA_SLOT_SIZE: 1310720
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail on leftover merge conflict markers
+        run: |
+          if grep -rInE --exclude-dir=.git '^(<<<<<<<|>>>>>>>) ' . ; then
+            echo "Nalezeny neuzavrene merge konflikty"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.cache/pip
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio "esptool==4.8.1"
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Check firmware fits the OTA slot
+        run: |
+          size=$(stat -c %s "$BUILD_DIR/firmware.bin")
+          pct=$(( size * 100 / OTA_SLOT_SIZE ))
+          echo "firmware.bin: $size B ($pct % OTA oddilu)" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$size" -gt "$OTA_SLOT_SIZE" ]; then
+            echo "Firmware se nevejde do OTA oddilu"
+            exit 1
+          fi
+
+      - name: Check version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          fw=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' src/main.cpp)
+          if [ "$tag" != "$fw" ]; then
+            echo "Tag v$tag nesouhlasi s FW_VERSION $fw v src/main.cpp"
+            exit 1
+          fi
+          grep -q "^## \[$tag\]" CHANGELOG.md || { echo "V CHANGELOG.md chybi sekce [$tag]"; exit 1; }
+
+      - name: Build factory image
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          boot_app0="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
+          mkdir -p release
+          cp "$BUILD_DIR/firmware.bin" release/firmware.bin
+          esptool.py --chip esp32c3 merge_bin -o release/factory.bin \
+            --flash_mode keep --flash_freq keep --flash_size keep \
+            0x0 "$BUILD_DIR/bootloader.bin" \
+            0x8000 "$BUILD_DIR/partitions.bin" \
+            0xe000 "$boot_app0" \
+            0x10000 "$BUILD_DIR/firmware.bin"
+          (cd release && sha256sum firmware.bin factory.bin > SHA256SUMS.txt)
+          ls -l release
+
+      - name: Release notes from CHANGELOG
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          awk -v v="$tag" '
+            $0 ~ "^## \\[" v "\\]" {on=1; next}
+            on && /^## \[/ {exit}
+            on {print}
+          ' CHANGELOG.md > release/notes.md
+          cat >> release/notes.md <<'EOF'
+
+          ---
+
+          **Soubory**
+          - `firmware.bin` - aktualizace přes web (záložka *Aktualizace*), konfigurace zůstane zachována. Vyžaduje FW 2.2.1 nebo novější.
+          - `factory.bin` - čistá instalace kabelem od adresy `0x0`, **smaže konfiguraci**.
+          EOF
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release/notes.md
+          files: |
+            release/firmware.bin
+            release/factory.bin
+            release/SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: ${{ env.BUILD_DIR }}/firmware.bin
